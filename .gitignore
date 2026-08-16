@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+
+# Runtime data is intentionally not bundled; Firebase is the source of truth.
+data/users/*.json
+data/scans/*.json
+data/firebase_keys/*.json
+data/panel_logs/*.json
