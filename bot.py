@@ -52,6 +52,7 @@ from telegram.ext import (
 
 # ==================== CONFIGURATION ====================
 PANEL_URL = "https://eraxpanel.vercel.app/"
+FIREBASE_ONLY_API_FALLBACK = "ERA"
 FORCE_JOIN_CHANNELS = ("@eraXarmy", "@eraXearning")
 MAX_BULK_SIZE = 50
 MAX_FILE_SIZE = 50 * 1024 * 1024
@@ -704,6 +705,16 @@ class PanelExchanger:
                 'found': False
             }
 
+            # Plain Firebase database URLs are valid inputs, not only encoded panel links.
+            raw_data = PanelExchanger._parse_firebase_data(link)
+            if raw_data.get('database_url'):
+                raw_url = str(raw_data['database_url']).strip()
+                if not re.match(r'https?://', raw_url, re.IGNORECASE):
+                    raw_data['database_url'] = f"https://{raw_url}"
+                raw_data['api_key'] = raw_data.get('api_key') or FIREBASE_ONLY_API_FALLBACK
+                raw_data['found'] = True
+                return raw_data
+
             if 's' in query:
                 encoded = query['s'][0]
                 try:
@@ -720,7 +731,7 @@ class PanelExchanger:
                         if part1 and part1.lower() != 'ok':
                             firebase_data['api_key'] = part1
                         else:
-                            firebase_data['api_key'] = 'Ok'
+                            firebase_data['api_key'] = FIREBASE_ONLY_API_FALLBACK
                         firebase_data['found'] = True
                         # Try to extract project id from DB url host
                         m = re.match(r'https?://([A-Za-z0-9.-]+)\.', part0)
@@ -894,13 +905,15 @@ class PanelExchanger:
         url = str(url).strip()
         if re.match(r'https?://', url, re.IGNORECASE):
             return url
+        if re.search(r'\.(?:firebaseio\.com|firebasedatabase\.app)$', url, re.IGNORECASE):
+            return f"https://{url}"
         return f"https://{url}.firebaseio.com"
 
     @staticmethod
     def generate_encoded_link(firebase_data):
         """Build the ERA X BOT share link: ?s= base64(DB_URL|||API_KEY)."""
         db_url = PanelExchanger._db_url_of(firebase_data)
-        api_key = firebase_data.get('api_key') or "Ok"
+        api_key = firebase_data.get('api_key') or FIREBASE_ONLY_API_FALLBACK
         if not db_url:
             return None
         payload = f"{db_url}|||{api_key}"
@@ -953,6 +966,13 @@ class Bot:
         except Exception:
             pass
 
+    @staticmethod
+    def _plain_text(text):
+        """Remove Telegram HTML/custom-emoji markup for a safe fallback."""
+        text = re.sub(r'<tg-emoji\b[^>]*>(.*?)</tg-emoji>', r'\1', str(text), flags=re.S)
+        text = re.sub(r'</?(?:b|strong|i|em|u|s|code|pre|blockquote|a)(?:\s[^>]*)?>', '', text, flags=re.I)
+        return html.unescape(text)
+
     async def _send_user(self, msg, text, **kwargs):
         """Send a user-facing message after removing the previous tracked one."""
         user_id = getattr(getattr(msg, 'from_user', None), 'id', None)
@@ -960,8 +980,10 @@ class Bot:
         try:
             sent = await msg.get_bot().send_message(chat_id=msg.chat_id, text=text, **kwargs)
         except Exception:
-            kwargs.pop('parse_mode', None)
-            sent = await msg.get_bot().send_message(chat_id=msg.chat_id, text=text, **kwargs)
+            fallback = self._plain_text(text)
+            sent = await msg.get_bot().send_message(
+                chat_id=msg.chat_id, text=fallback, parse_mode=None,
+                reply_markup=kwargs.get('reply_markup'))
         if user_id and not self._is_admin(user_id):
             self.user_last_message_ids[user_id] = sent.message_id
         return sent
@@ -985,15 +1007,17 @@ class Bot:
         for channel in FORCE_JOIN_CHANNELS:
             try:
                 member = await context.bot.get_chat_member(channel, user_id)
-                joined = member.status in ("creator", "administrator", "member")
-                if getattr(member, "status", None) == "restricted":
+                status = str(getattr(member, "status", "")).lower()
+                joined = status in {"creator", "administrator", "member"}
+                if status == "restricted":
                     joined = bool(getattr(member, "is_member", False))
                 if not joined:
                     missing.append(channel)
             except Exception as exc:
-                logger.warning("Force-join check unavailable for %s: %s", channel, exc)
-                # Fail open if the bot cannot inspect a configured channel.
-                return []
+                logger.warning("Force-join check failed for %s: %s", channel, exc)
+                # Do not silently bypass force-join when a configured channel
+                # cannot be checked; require that channel until Telegram replies.
+                missing.append(channel)
         return missing
 
     async def _is_force_joined(self, update, context):
@@ -1067,7 +1091,7 @@ class Bot:
         lines.append(f"{custom_emoji('✅')} <b>Firebase Config Found!</b>\n━━━━━━━━━━━━━━━━━━")
         apk_label = html.escape(str(apk_name or data.get('apk_name', 'Sent file')))
         db_url = html.escape(str(PanelExchanger._db_url_of(data) or 'Not Found'))
-        api_key = html.escape(str(data.get('api_key') or 'Ok'))
+        api_key = html.escape(str(data.get('api_key') or FIREBASE_ONLY_API_FALLBACK))
         lines.append(f"{custom_emoji('🚩')} <b>APK:</b> {apk_label}")
         # Credentials are intentionally shown only in this immediate scan result.
         lines.append(f"{custom_emoji('🌐')} <b>Firebase URL</b>\n{db_url}")
@@ -1119,6 +1143,7 @@ class Bot:
                     await self._send_user(
                         update.message,
                         self._format_era_result(scan_data),
+                        parse_mode='HTML',
                         reply_markup=self._era_buttons(scan_data))
                 else:
                     await self._clear_user_message(update.message)
@@ -1266,7 +1291,7 @@ class Bot:
             lines.append("⚠️ *DUPLICATE — already in database*")
         lines.append("✅ <b>Firebase Config Found!</b>\n━━━━━━━━━━━━━━━━━━\n")
         db_url = html.escape(str(PanelExchanger._db_url_of(firebase_data) or 'Not Found'))
-        api_key = html.escape(str(firebase_data.get('api_key') or 'Ok'))
+        api_key = html.escape(str(firebase_data.get('api_key') or FIREBASE_ONLY_API_FALLBACK))
         lines.append(f"🌐 <b>Firebase URL</b>\n{db_url}\n")
         lines.append(f"🎆 <b>API Key</b>\n{api_key}\n")
         link = PanelExchanger.generate_encoded_link(firebase_data)
@@ -1339,6 +1364,7 @@ class Bot:
         if urls:
             converted = False
             for url in urls:
+                url = url.rstrip('.,;!?)]}>')
                 ok = await self.handle_panel_link(update, url)
                 if ok:
                     converted = True
@@ -1478,7 +1504,7 @@ class Bot:
         for item in panels:
             data = {
                 'database_url': item.get('database_url'),
-                'api_key': item.get('api_key') or 'Ok',
+                'api_key': item.get('api_key') or FIREBASE_ONLY_API_FALLBACK,
                 'project_id': item.get('project_id'),
                 'app_id': item.get('app_id'),
             }
@@ -1524,7 +1550,7 @@ class Bot:
         page_items = keys[page * page_size:(page + 1) * page_size]
         blocks = []
         for index, item in enumerate(page_items, start=page * page_size + 1):
-            api_key = str(item.get('api_key') or 'Ok')
+            api_key = str(item.get('api_key') or FIREBASE_ONLY_API_FALLBACK)
             database_url = str(item.get('database_url') or item.get('firebase_url') or 'Not Found')
             project_id = str(item.get('project_id') or 'Not Found')
             blocks.append(
@@ -1628,7 +1654,7 @@ class Bot:
                 return
             lines = ['🔑 Firebase records']
             for k in keys[:50]:
-                lines.append(f"DB: {k.get('database_url') or '-'}\nAPI: {k.get('api_key') or 'Ok'}\nProject: {k.get('project_id') or '-'}\n")
+                lines.append(f"DB: {k.get('database_url') or '-'}\nAPI: {k.get('api_key') or FIREBASE_ONLY_API_FALLBACK}\nProject: {k.get('project_id') or '-'}\n")
             await query.message.reply_text('\n'.join(lines)[:4000])
         elif action == 'admin_scans':
             scans = Database.get_all_scans()[:30]
@@ -1639,7 +1665,7 @@ class Bot:
         elif action == 'admin_duplicates':
             seen, duplicates = set(), 0
             for s in Database.get_all_scans():
-                key = (PanelExchanger._db_url_of(s), s.get('api_key') or 'Ok')
+                key = (PanelExchanger._db_url_of(s), s.get('api_key') or FIREBASE_ONLY_API_FALLBACK)
                 if key[0] and key in seen:
                     duplicates += 1
                 elif key[0]:
