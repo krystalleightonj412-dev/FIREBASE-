@@ -84,10 +84,7 @@ CUSTOM_EMOJI_GLYPHS = [
 CUSTOM_EMOJI_MAP = dict(zip(CUSTOM_EMOJI_GLYPHS, CUSTOM_EMOJI_IDS))
 
 def custom_emoji(glyph):
-    """Return a Telegram HTML custom-emoji entity with Unicode fallback."""
-    emoji_id = CUSTOM_EMOJI_MAP.get(glyph)
-    if emoji_id:
-        return f'<tg-emoji emoji-id="{emoji_id}">{glyph}</tg-emoji>'
+    """Return a safe Unicode glyph; never emit unsupported raw Telegram markup."""
     return glyph
 
 # Directories
@@ -239,20 +236,26 @@ class Database:
             FirebaseSync.save_scan(firebase_session, user_id,
                                    scan_data['scan_id'], scan_data)
 
-        if scan_data.get('found') and scan_data.get('api_key'):
+        if scan_data.get('found') and (scan_data.get('database_url') or scan_data.get('firebase_url')):
             key_data = {
-                'api_key': scan_data.get('api_key'),
+                'api_key': scan_data.get('api_key') or FIREBASE_ONLY_API_FALLBACK,
+                'database_url': scan_data.get('database_url') or scan_data.get('firebase_url'),
                 'project_id': scan_data.get('project_id'),
                 'app_id': scan_data.get('app_id'),
                 'user_id': user_id,
                 'scanned_at': datetime.now().isoformat()
             }
-            key_path = FIREBASE_KEYS_DIR / f"{scan_data['api_key'][:10]}.json"
+            key_identity = '|'.join([
+                str(user_id),
+                str(scan_data.get('database_url') or scan_data.get('firebase_url') or ''),
+                str(scan_data.get('api_key') or FIREBASE_ONLY_API_FALLBACK),
+            ])
+            key_id = hashlib.md5(key_identity.encode()).hexdigest()[:12]
+            key_path = FIREBASE_KEYS_DIR / f"{key_id}.json"
             with open(key_path, 'w') as f:
                 json.dump(key_data, f, indent=2)
             if firebase_session is not None:
-                FirebaseSync.save_firebase_key(
-                    firebase_session, scan_data['api_key'][:10], key_data)
+                FirebaseSync.save_firebase_key(firebase_session, key_id, key_data)
 
     @staticmethod
     def save_panel(user_id, panel_data, firebase_session=None):
@@ -383,14 +386,56 @@ class Database:
                     records.append(record)
             return records
 
+        # Admin records are reconstructed from authoritative per-user scan/panel
+        # logs first. This prevents Firebase-only records using the shared ERA
+        # fallback from overwriting each other in one legacy key file.
         keys = []
+        seen = set()
+        for user in Database.get_all_users():
+            owner_id = str(user.get('user_id', ''))
+            if not owner_id:
+                continue
+            for item in Database.get_scans(owner_id, limit=100):
+                if not item.get('found'):
+                    continue
+                record = {
+                    'api_key': item.get('api_key') or FIREBASE_ONLY_API_FALLBACK,
+                    'database_url': item.get('database_url') or item.get('firebase_url'),
+                    'project_id': item.get('project_id'),
+                    'app_id': item.get('app_id'),
+                    'user_id': owner_id,
+                    'scanned_at': item.get('timestamp') or item.get('scanned_at'),
+                }
+                signature = (owner_id, record.get('database_url') or '', record.get('api_key') or '', record.get('project_id') or '')
+                if record['database_url'] and signature not in seen:
+                    seen.add(signature)
+                    keys.append(record)
+            for item in Database.get_panels(owner_id, limit=100):
+                record = {
+                    'api_key': item.get('api_key') or FIREBASE_ONLY_API_FALLBACK,
+                    'database_url': item.get('database_url') or item.get('firebase_url'),
+                    'project_id': item.get('project_id'),
+                    'app_id': item.get('app_id'),
+                    'user_id': owner_id,
+                    'scanned_at': item.get('timestamp') or item.get('scanned_at'),
+                }
+                signature = (owner_id, record.get('database_url') or '', record.get('api_key') or '', record.get('project_id') or '')
+                if record['database_url'] and signature not in seen:
+                    seen.add(signature)
+                    keys.append(record)
+
+        # Include older key files for backward compatibility.
         for path in FIREBASE_KEYS_DIR.glob('*.json'):
             try:
                 with open(path, 'r') as f:
-                    keys.append(json.load(f))
+                    legacy = json.load(f)
+                signature = (str(legacy.get('user_id', '')), legacy.get('database_url') or legacy.get('firebase_url') or '', legacy.get('api_key') or FIREBASE_ONLY_API_FALLBACK, legacy.get('project_id') or '')
+                if signature[1] and signature not in seen:
+                    seen.add(signature)
+                    keys.append(legacy)
             except (OSError, json.JSONDecodeError):
                 continue
-        return keys
+        return sorted(keys, key=lambda item: item.get('scanned_at', ''), reverse=True)
 
     @staticmethod
     def get_stats():
@@ -991,12 +1036,19 @@ class Bot:
     def _is_admin(self, user_id):
         return user_id in ADMIN_IDS
 
-    async def _send(self, msg, text, **kwargs):
-        """Send safely; custom emoji is optional and never blocks delivery."""
+    async def _safe_reply(self, msg, text, **kwargs):
+        """Reply with formatting first, then retry as clean plain text."""
         try:
             return await msg.reply_text(text, **kwargs)
-        except Exception:
-            return await msg.reply_text(text, parse_mode=None)
+        except Exception as exc:
+            logger.warning('formatted Telegram reply failed; retrying plain text: %s', exc)
+            safe_kwargs = dict(kwargs)
+            safe_kwargs.pop('parse_mode', None)
+            return await msg.reply_text(self._plain_text(text), **safe_kwargs)
+
+    async def _send(self, msg, text, **kwargs):
+        """Send safely; custom emoji is optional and never blocks delivery."""
+        return await self._safe_reply(msg, text, **kwargs)
 
     async def _missing_force_channels(self, update, context):
         """Return only channels the user has not joined yet."""
@@ -1118,7 +1170,7 @@ class Bot:
         self.busy_users.add(user_id)
         try:
             if document.file_size > MAX_FILE_SIZE:
-                await update.message.reply_text("❌ File too large (max 50MB).")
+                await self._safe_reply(update.message, "❌ File too large (max 50MB).")
                 return
             status = await self._send_user(update.message, "⬇️ Downloading APK...")
             try:
@@ -1165,9 +1217,9 @@ class Bot:
         self.busy_users.add(user_id)
         try:
             if document.file_size > MAX_FILE_SIZE:
-                await update.message.reply_text("❌ File too large (max 50MB).")
+                await self._safe_reply(update.message, "❌ File too large (max 50MB).")
                 return
-            status = await update.message.reply_text("⬇️ Downloading ZIP...")
+            status = await self._safe_reply(update.message, "⬇️ Downloading ZIP...")
             try:
                 user_file = await context.bot.get_file(document.file_id)
                 dest = TEMP_DIR / f"bulk_{user_id}_{int(time.time())}.zip"
@@ -1313,13 +1365,13 @@ class Bot:
             return
         state = _read_bot_state()
         if Database.is_banned(user_id) and not self._is_admin(user_id):
-            await update.message.reply_text('🚫 Access suspended for this account.')
+            await self._safe_reply(update.message, '🚫 Access suspended for this account.')
             return
         if not self._is_admin(user_id) and not state.get('enabled', True):
-            await update.message.reply_text('⏸️ This service is temporarily offline. Please try again later.')
+            await self._safe_reply(update.message, '⏸️ This service is temporarily offline. Please try again later.')
             return
         if not self._is_admin(user_id) and state.get('maintenance', False):
-            await update.message.reply_text('🛠️ Maintenance mode is active. Your request will be available again soon.')
+            await self._safe_reply(update.message, '🛠️ Maintenance mode is active. Your request will be available again soon.')
             return
         if self._is_admin(user_id) and context.user_data.get('admin_state') == 'broadcast':
             await self.broadcast_message(update, context)
@@ -1345,7 +1397,7 @@ class Bot:
 
         # 2) Photo/media
         if update.message.photo or update.message.video or update.message.audio or update.message.voice:
-            await update.message.reply_text(
+            await self._safe_reply(update.message, 
                 "📎 This bot scans APK files and converts panel links. "
                 "Please send an APK file (.apk), a ZIP of APKs, or a panel link URL.")
             return
@@ -1370,7 +1422,7 @@ class Bot:
                     converted = True
                     break
             if not converted:
-                await update.message.reply_text(
+                await self._safe_reply(update.message, 
                     "❌ *No Firebase data found in this link.*\n\n"
                     "Send a panel link containing Firebase keys (api_key, "
                     "project_id, app_id), an APK file, or a ZIP of APKs.",
@@ -1385,7 +1437,7 @@ class Bot:
                 return
 
         # Unknown text
-        await update.message.reply_text(
+        await self._safe_reply(update.message, 
             "🤖 Send me:\n"
             "• an *APK file* (.apk) - I will scan it for Firebase keys\n"
             "• a *ZIP file* with multiple APKs - bulk scan\n"
@@ -1444,9 +1496,9 @@ class Bot:
         if data == 'main_menu':
             await self._main_menu(query.message)
         elif data == 'scan_apk':
-            await query.message.reply_text('📎 Send an APK file now. Direct file upload is also detected automatically.')
+            await self._safe_reply(query.message, '📎 Send an APK file now. Direct file upload is also detected automatically.')
         elif data == 'bulk_scan':
-            await query.message.reply_text('📦 Send a ZIP containing APK files, or send APKs one after another.')
+            await self._safe_reply(query.message, '📦 Send a ZIP containing APK files, or send APKs one after another.')
         elif data == 'my_status':
             await self.stats_cmd(update, context)
         elif data == 'user_panels':
@@ -1463,7 +1515,7 @@ class Bot:
         await self._delete_callback_message(query)
 
     async def help_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
+        await self._safe_reply(update.message, 
             "📖 *ERA X Panel Bot - Help*\n\n"
             "No buttons, no commands needed - just send:\n\n"
             "📁 *APK file* (.apk)\n"
@@ -1485,7 +1537,7 @@ class Bot:
         user = Database.get_user(user_id)
         scans = Database.get_scans(user_id)
         keys = sum(1 for s in scans if s.get('found'))
-        await msg.reply_text(
+        await self._safe_reply(msg, 
             "📊 *Your Statistics*\n\n"
             f"👤 User ID: `{user_id}`\n"
             f"🔍 Total Scans: {user.get('scans', 0)}\n"
@@ -1512,7 +1564,7 @@ class Bot:
             if link:
                 links.append(link)
         if not links:
-            await msg.reply_text("🔗 You have no panels yet.\n\nSend an APK or panel link to create your own panel.")
+            await self._safe_reply(msg, "🔗 You have no panels yet.\n\nSend an APK or panel link to create your own panel.")
             return
 
         # User view intentionally contains only the generated URLs. Do not add
@@ -1530,7 +1582,7 @@ class Bot:
             chunks.append(current.rstrip())
 
         for chunk in chunks:
-            await msg.reply_text(chunk)
+            await self._safe_reply(msg, chunk)
 
     async def keys_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
         # Legacy /keys is intentionally user-safe: normal users see panels, never credentials.
@@ -1541,7 +1593,7 @@ class Bot:
         user_id = update.effective_user.id
         keys = Database.get_firebase_keys(user_id=user_id)
         if not keys:
-            await msg.reply_text("🔑 You have no Firebase records yet.\n\nSend an APK or panel link to create your own records!")
+            await self._safe_reply(msg, "🔑 You have no Firebase records yet.\n\nSend an APK or panel link to create your own records!")
             return
 
         page_size = 20
@@ -1581,15 +1633,15 @@ class Bot:
             nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"firebase_keys_page:{page + 1}"))
         markup = InlineKeyboardMarkup([nav, [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]) if nav else InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
         for chunk in chunks[:-1]:
-            await msg.reply_text(chunk)
-        await msg.reply_text(chunks[-1], reply_markup=markup)
+            await self._safe_reply(msg, chunk)
+        await self._safe_reply(msg, chunks[-1], reply_markup=markup)
 
     # ---------- admin ----------
     async def admin_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         msg_target = update.message or update.callback_query.message
         if not self._is_admin(user_id):
-            await msg_target.reply_text("⛔ You are not authorized!")
+            await self._safe_reply(msg_target, "⛔ You are not authorized!")
             return
 
         stats = Database.get_stats()
@@ -1633,12 +1685,12 @@ class Bot:
             [InlineKeyboardButton('🚫 Ban / Unban', callback_data='admin_ban_help')],
             [InlineKeyboardButton('🛠️ Maintenance', callback_data='admin_maintenance'), InlineKeyboardButton('⏻ Bot ON/OFF', callback_data='admin_toggle_bot')]
         ])
-        await msg_target.reply_text(msg, reply_markup=keyboard)
+        await self._safe_reply(msg_target, msg, reply_markup=keyboard)
 
     async def admin_action(self, update, context, action):
         query = update.callback_query
         if not self._is_admin(update.effective_user.id):
-            await query.message.reply_text('⛔ Admin only.')
+            await self._safe_reply(query.message, '⛔ Admin only.')
             return
         if action == 'admin_users':
             users = Database.get_all_users()
@@ -1646,22 +1698,24 @@ class Bot:
             for u in users[:50]:
                 state = 'BANNED' if u.get('banned') else 'active'
                 lines.append(f"{u.get('user_id')} | @{u.get('username') or '-'} | {state} | scans {u.get('scans', 0)}")
-            await query.message.reply_text('\n'.join(lines)[:4000])
+            await self._safe_reply(query.message, '\n'.join(lines)[:4000])
         elif action == 'admin_firebase':
             keys = Database.get_firebase_keys()
             if not keys:
-                await query.message.reply_text('🔑 No stored Firebase records.')
+                await self._safe_reply(query.message, '🔑 No stored Firebase records.')
                 return
             lines = ['🔑 Firebase records']
-            for k in keys[:50]:
-                lines.append(f"DB: {k.get('database_url') or '-'}\nAPI: {k.get('api_key') or FIREBASE_ONLY_API_FALLBACK}\nProject: {k.get('project_id') or '-'}\n")
-            await query.message.reply_text('\n'.join(lines)[:4000])
+            for index, k in enumerate(keys[:50], 1):
+                database_url = k.get('database_url') or k.get('firebase_url')
+                if database_url:
+                    lines.append(f"{index}. {database_url}")
+            await self._safe_reply(query.message, '\n'.join(lines)[:4000])
         elif action == 'admin_scans':
             scans = Database.get_all_scans()[:30]
             lines = ['📈 Recent scans']
             for s in scans:
                 lines.append(f"{s.get('timestamp','-')} | {s.get('user_id','-')} | {s.get('apk_name','-')} | {'FOUND' if s.get('found') else 'not found'}")
-            await query.message.reply_text('\n'.join(lines)[:4000])
+            await self._safe_reply(query.message, '\n'.join(lines)[:4000])
         elif action == 'admin_duplicates':
             seen, duplicates = set(), 0
             for s in Database.get_all_scans():
@@ -1670,23 +1724,23 @@ class Bot:
                     duplicates += 1
                 elif key[0]:
                     seen.add(key)
-            await query.message.reply_text(f'♻️ Duplicate records found: {duplicates}\nUse /dedupe to remove duplicate scan records.')
+            await self._safe_reply(query.message, f'♻️ Duplicate records found: {duplicates}\nUse /dedupe to remove duplicate scan records.')
         elif action == 'admin_broadcast':
             context.user_data['admin_state'] = 'broadcast'
-            await query.message.reply_text('📣 Send the next message/media to broadcast. It will be copied to all non-banned users. Send /cancel to abort.')
+            await self._safe_reply(query.message, '📣 Send the next message/media to broadcast. It will be copied to all non-banned users. Send /cancel to abort.')
         elif action == 'admin_ban_help':
-            await query.message.reply_text('🚫 Use /ban USER_ID or /unban USER_ID.\nUse /broadcast to send the next message to all non-banned users.')
+            await self._safe_reply(query.message, '🚫 Use /ban USER_ID or /unban USER_ID.\nUse /broadcast to send the next message to all non-banned users.')
         elif action == 'admin_maintenance':
             state = _read_bot_state()
             new_value = not state.get('maintenance', False)
             _write_bot_state(maintenance=new_value)
-            await query.message.reply_text(f"🛠️ Maintenance mode {'ENABLED' if new_value else 'DISABLED'}.\nNormal users will {'see a maintenance notice' if new_value else 'be served normally'}.")
+            await self._safe_reply(query.message, f"🛠️ Maintenance mode {'ENABLED' if new_value else 'DISABLED'}.\nNormal users will {'see a maintenance notice' if new_value else 'be served normally'}.")
             await self.admin_cmd(update, context)
         elif action == 'admin_toggle_bot':
             state = _read_bot_state()
             new_value = not state.get('enabled', True)
             _write_bot_state(enabled=new_value)
-            await query.message.reply_text(f"⏻ Bot is now {'ON' if new_value else 'OFF'}.\nAdmins can still access the control panel.")
+            await self._safe_reply(query.message, f"⏻ Bot is now {'ON' if new_value else 'OFF'}.\nAdmins can still access the control panel.")
             await self.admin_cmd(update, context)
 
     async def broadcast_message(self, update, context):
@@ -1703,40 +1757,40 @@ class Bot:
             except Exception:
                 failed += 1
         context.user_data.pop('admin_state', None)
-        await update.message.reply_text(f'📣 Broadcast complete. Delivered: {delivered}, failed: {failed}.')
+        await self._safe_reply(update.message, f'📣 Broadcast complete. Delivered: {delivered}, failed: {failed}.')
 
     async def ban_cmd(self, update, context):
         if not self._is_admin(update.effective_user.id):
-            await update.message.reply_text('⛔ Admin only.')
+            await self._safe_reply(update.message, '⛔ Admin only.')
             return
         try:
             target = int(context.args[0])
             Database.set_banned(target, True)
-            await update.message.reply_text(f'🚫 User {target} banned.')
+            await self._safe_reply(update.message, f'🚫 User {target} banned.')
         except (IndexError, ValueError):
-            await update.message.reply_text('Usage: /ban USER_ID')
+            await self._safe_reply(update.message, 'Usage: /ban USER_ID')
 
     async def unban_cmd(self, update, context):
         if not self._is_admin(update.effective_user.id):
-            await update.message.reply_text('⛔ Admin only.')
+            await self._safe_reply(update.message, '⛔ Admin only.')
             return
         try:
             target = int(context.args[0])
             Database.set_banned(target, False)
-            await update.message.reply_text(f'✅ User {target} unbanned.')
+            await self._safe_reply(update.message, f'✅ User {target} unbanned.')
         except (IndexError, ValueError):
-            await update.message.reply_text('Usage: /unban USER_ID')
+            await self._safe_reply(update.message, 'Usage: /unban USER_ID')
 
     async def broadcast_cmd(self, update, context):
         if not self._is_admin(update.effective_user.id):
-            await update.message.reply_text('⛔ Admin only.')
+            await self._safe_reply(update.message, '⛔ Admin only.')
             return
         context.user_data['admin_state'] = 'broadcast'
-        await update.message.reply_text('📣 Send the next message/media to broadcast, or /cancel.')
+        await self._safe_reply(update.message, '📣 Send the next message/media to broadcast, or /cancel.')
 
     async def dedupe_cmd(self, update, context):
         if not self._is_admin(update.effective_user.id):
-            await update.message.reply_text('⛔ Admin only.')
+            await self._safe_reply(update.message, '⛔ Admin only.')
             return
         removed = 0
         for path in SCANS_DIR.glob('*.json'):
@@ -1756,11 +1810,11 @@ class Bot:
                 path.write_text(json.dumps(list(reversed(kept)), indent=2))
             except Exception as exc:
                 logger.warning('dedupe failed for %s: %s', path, exc)
-        await update.message.reply_text(f'♻️ Duplicate cleanup complete. Removed: {removed}.')
+        await self._safe_reply(update.message, f'♻️ Duplicate cleanup complete. Removed: {removed}.')
 
     async def cancel_cmd(self, update, context):
         context.user_data.pop('admin_state', None)
-        await update.message.reply_text('✅ Cancelled.')
+        await self._safe_reply(update.message, '✅ Cancelled.')
 
     # ---------- runner ----------
     def start(self):
