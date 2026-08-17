@@ -52,6 +52,7 @@ from telegram.ext import (
 
 # ==================== CONFIGURATION ====================
 PANEL_URL = "https://eraxpanel.vercel.app/"
+FORCE_JOIN_CHANNELS = ("@eraXarmy", "@eraXearning")
 MAX_BULK_SIZE = 50
 MAX_FILE_SIZE = 50 * 1024 * 1024
 DOWNLOAD_TIMEOUT = 60
@@ -935,6 +936,35 @@ class Bot:
         self.application = None
         self.firebase_session = firebase_session
         self.busy_users = set()
+        self.user_last_message_ids = {}
+
+    async def _clear_user_message(self, msg):
+        """Delete the previous tracked bot message for a normal user, if possible."""
+        if not msg or not getattr(msg, 'chat_id', None):
+            return
+        user_id = getattr(getattr(msg, 'from_user', None), 'id', None)
+        if not user_id or self._is_admin(user_id):
+            return
+        message_id = self.user_last_message_ids.pop(user_id, None)
+        if not message_id:
+            return
+        try:
+            await msg.get_bot().delete_message(chat_id=msg.chat_id, message_id=message_id)
+        except Exception:
+            pass
+
+    async def _send_user(self, msg, text, **kwargs):
+        """Send a user-facing message after removing the previous tracked one."""
+        user_id = getattr(getattr(msg, 'from_user', None), 'id', None)
+        await self._clear_user_message(msg)
+        try:
+            sent = await msg.get_bot().send_message(chat_id=msg.chat_id, text=text, **kwargs)
+        except Exception:
+            kwargs.pop('parse_mode', None)
+            sent = await msg.get_bot().send_message(chat_id=msg.chat_id, text=text, **kwargs)
+        if user_id and not self._is_admin(user_id):
+            self.user_last_message_ids[user_id] = sent.message_id
+        return sent
 
     def _is_admin(self, user_id):
         return user_id in ADMIN_IDS
@@ -945,6 +975,55 @@ class Bot:
             return await msg.reply_text(text, **kwargs)
         except Exception:
             return await msg.reply_text(text, parse_mode=None)
+
+    async def _missing_force_channels(self, update, context):
+        """Return only channels the user has not joined yet."""
+        user_id = update.effective_user.id
+        if self._is_admin(user_id):
+            return []
+        missing = []
+        for channel in FORCE_JOIN_CHANNELS:
+            try:
+                member = await context.bot.get_chat_member(channel, user_id)
+                joined = member.status in ("creator", "administrator", "member")
+                if getattr(member, "status", None) == "restricted":
+                    joined = bool(getattr(member, "is_member", False))
+                if not joined:
+                    missing.append(channel)
+            except Exception as exc:
+                logger.warning("Force-join check unavailable for %s: %s", channel, exc)
+                # Fail open if the bot cannot inspect a configured channel.
+                return []
+        return missing
+
+    async def _is_force_joined(self, update, context):
+        return not await self._missing_force_channels(update, context)
+
+    async def _delete_callback_message(self, query):
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+    async def _force_join_prompt(self, update, context):
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        missing = await self._missing_force_channels(update, context)
+        buttons = []
+        channel_labels = {
+            "@eraXarmy": ("📢 Join ERA X Army", "https://t.me/eraXarmy"),
+            "@eraXearning": ("💰 Join ERA X Earning", "https://t.me/eraXearning"),
+        }
+        for channel in missing:
+            label, url = channel_labels[channel]
+            buttons.append([InlineKeyboardButton(label, url=url)])
+        buttons.append([InlineKeyboardButton("✅ I Joined — Check Again", callback_data="check_join")])
+        keyboard = InlineKeyboardMarkup(buttons)
+        msg = update.message or update.callback_query.message
+        await self._send_user(
+            msg,
+            f"{custom_emoji('🔒')} <b>Join the remaining channel(s)</b>\n\n"
+            f"{custom_emoji('⚡')} Join only the channel button(s) shown below, then check again.",
+            parse_mode="HTML", reply_markup=keyboard)
 
     # ---------- scan core ----------
     def _scan_apk_sync(self, apk_path, user_id, username=None):
@@ -990,6 +1069,9 @@ class Bot:
         db_url = html.escape(str(PanelExchanger._db_url_of(data) or 'Not Found'))
         api_key = html.escape(str(data.get('api_key') or 'Ok'))
         lines.append(f"{custom_emoji('🚩')} <b>APK:</b> {apk_label}")
+        # Credentials are intentionally shown only in this immediate scan result.
+        lines.append(f"{custom_emoji('🌐')} <b>Firebase URL</b>\n{db_url}")
+        lines.append(f"{custom_emoji('🎆')} <b>API Key</b>\n{api_key}")
         link = PanelExchanger.generate_encoded_link(data)
         if link:
             lines.append(f"{custom_emoji('🔗')} <b>Panel Link:</b>\n{html.escape(link)}")
@@ -1014,7 +1096,7 @@ class Bot:
             if document.file_size > MAX_FILE_SIZE:
                 await update.message.reply_text("❌ File too large (max 50MB).")
                 return
-            status = await update.message.reply_text("⬇️ Downloading APK...")
+            status = await self._send_user(update.message, "⬇️ Downloading APK...")
             try:
                 user_file = await context.bot.get_file(document.file_id)
                 file_name = document.file_name or "file.apk"
@@ -1033,11 +1115,15 @@ class Bot:
                 dest.unlink(missing_ok=True)
 
                 if scan_data.get('found'):
-                    await update.message.reply_text(
+                    await self._clear_user_message(update.message)
+                    await self._send_user(
+                        update.message,
                         self._format_era_result(scan_data),
                         reply_markup=self._era_buttons(scan_data))
                 else:
-                    await update.message.reply_text(
+                    await self._clear_user_message(update.message)
+                    await self._send_user(
+                        update.message,
                         "❌ No Firebase config found in this APK.")
                 await status.delete()
             except Exception as e:
@@ -1168,7 +1254,7 @@ class Bot:
         asyncio.create_task(asyncio.to_thread(
             Database.save_panel, user_id, panel_record, self.firebase_session))
 
-        # Firebase credentials stay hidden from normal users; only the generated panel is returned.
+        # Immediate conversion result includes credentials, while the saved Panel view remains private.
         # Duplicate lookup is local-only and is kept off the event loop.
         try:
             dup = await asyncio.wait_for(
@@ -1178,20 +1264,28 @@ class Bot:
         lines = []
         if dup:
             lines.append("⚠️ *DUPLICATE — already in database*")
-        lines.append("✅ *Panel ready!*\n━━━━━━━━━━━━━━━━━━\n")
+        lines.append("✅ <b>Firebase Config Found!</b>\n━━━━━━━━━━━━━━━━━━\n")
+        db_url = html.escape(str(PanelExchanger._db_url_of(firebase_data) or 'Not Found'))
+        api_key = html.escape(str(firebase_data.get('api_key') or 'Ok'))
+        lines.append(f"🌐 <b>Firebase URL</b>\n{db_url}\n")
+        lines.append(f"🎆 <b>API Key</b>\n{api_key}\n")
         link = PanelExchanger.generate_encoded_link(firebase_data)
         if link:
-            lines.append(f"🔗 *Panel Link:*\n{link}\n")
+            lines.append(f"🔗 <b>Panel Link:</b>\n{html.escape(link)}\n")
         lines.append("━━━━━━━━━━━━━━━━━━")
-        await self._send(update.message, "\n".join(lines),
-                         reply_markup=self._era_buttons(firebase_data))
+        await self._send_user(update.message, "\n".join(lines), parse_mode='HTML',
+                              reply_markup=self._era_buttons(firebase_data))
         return True
 
     # ---------- message dispatcher (auto-detect) ----------
     async def on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Register user
+        # Register user and remove the previous user-facing bot message.
         user_id = update.effective_user.id
         user = update.effective_user
+        await self._clear_user_message(update.message)
+        if not await self._is_force_joined(update, context):
+            await self._force_join_prompt(update, context)
+            return
         state = _read_bot_state()
         if Database.is_banned(user_id) and not self._is_admin(user_id):
             await update.message.reply_text('🚫 Access suspended for this account.')
@@ -1288,7 +1382,7 @@ class Bot:
         keyboard = InlineKeyboardMarkup(rows)
         state = _read_bot_state()
         badge = '🟢 LIVE' if state.get('enabled', True) else '🔴 OFFLINE'
-        await self._send(msg,
+        await self._send_user(msg,
                          f"{custom_emoji('🚀')} <b>ERA X BOT</b>\n"
                          "╭────────────────────╮\n"
                          f"│  Service: <b>{html.escape(badge)}</b>       │\n"
@@ -1301,12 +1395,26 @@ class Bot:
                          parse_mode='HTML', reply_markup=keyboard)
 
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._is_force_joined(update, context):
+            await self._force_join_prompt(update, context)
+            return
         await self._main_menu(update.message)
 
     async def on_callback(self, update, context):
         query = update.callback_query
         data = query.data
         await query.answer()
+        if data == 'check_join':
+            if await self._is_force_joined(update, context):
+                await self._main_menu(query.message)
+            else:
+                await self._force_join_prompt(update, context)
+            await self._delete_callback_message(query)
+            return
+        if not await self._is_force_joined(update, context):
+            await self._force_join_prompt(update, context)
+            await self._delete_callback_message(query)
+            return
         if data == 'main_menu':
             await self._main_menu(query.message)
         elif data == 'scan_apk':
@@ -1326,6 +1434,7 @@ class Bot:
             await self.admin_cmd(update, context)
         elif data.startswith('admin_'):
             await self.admin_action(update, context, data)
+        await self._delete_callback_message(query)
 
     async def help_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
@@ -1644,7 +1753,7 @@ class Bot:
 
         self.application.add_handler(CommandHandler("start", self.start_cmd))
         self.application.add_handler(CommandHandler("help", self.help_cmd))
-        self.application.add_handler(CallbackQueryHandler(self.on_callback, pattern='^(main_menu|scan_apk|bulk_scan|my_status|user_panels|firebase_keys|firebase_keys_page:[0-9]+|admin_panel|admin_users|admin_firebase|admin_scans|admin_duplicates|admin_broadcast|admin_ban_help|admin_maintenance|admin_toggle_bot|open_db|open_panel)$'))
+        self.application.add_handler(CallbackQueryHandler(self.on_callback, pattern='^(main_menu|check_join|scan_apk|bulk_scan|my_status|user_panels|firebase_keys|firebase_keys_page:[0-9]+|admin_panel|admin_users|admin_firebase|admin_scans|admin_duplicates|admin_broadcast|admin_ban_help|admin_maintenance|admin_toggle_bot|open_db|open_panel)$'))
         self.application.add_handler(CommandHandler("stats", self.stats_cmd))
         self.application.add_handler(CommandHandler("keys", self.keys_cmd))
         self.application.add_handler(CommandHandler("admin", self.admin_cmd))
