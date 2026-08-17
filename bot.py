@@ -1791,11 +1791,11 @@ class Bot:
 
         # Auto-detect: documents (APK/ZIP) and text (panel links)
         self.application.add_handler(
-            MessageHandler(filters.Document.ALL & ~filters.COMMAND, self.on_message))
+            MessageHandler(filters.ChatType.PRIVATE & filters.Document.ALL & ~filters.COMMAND, self.on_message))
         self.application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_message))
+            MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, self.on_message))
         self.application.add_handler(
-            MessageHandler((filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE) & ~filters.COMMAND, self.on_message))
+            MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE) & ~filters.COMMAND, self.on_message))
 
         logger.info("Starting ERA X Panel Bot (auto-detect mode)...")
         self.application.run_polling(drop_pending_updates=True)
