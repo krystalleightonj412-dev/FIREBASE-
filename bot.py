@@ -130,6 +130,22 @@ def _write_bot_state(**changes):
     return state
 
 
+def canonical_firebase_url(value):
+    """Return one stable identity for a Firebase Realtime Database URL."""
+    value = str(value or '').strip()
+    if not value:
+        return ''
+    if not re.match(r'^https?://', value, re.IGNORECASE):
+        value = 'https://' + value
+    value = value.split('?', 1)[0].split('#', 1)[0].rstrip('/')
+    return value.lower()
+
+
+def firebase_record_key(value):
+    """Stable global key; the URL, not user/API key, defines uniqueness."""
+    return hashlib.sha256(canonical_firebase_url(value).encode('utf-8')).hexdigest()[:24]
+
+
 # ==================== FIREBASE SYNC ====================
 class FirebaseSync:
     """Fire-and-forget sync of user/scan data to Firebase Realtime Database."""
@@ -158,8 +174,73 @@ class FirebaseSync:
 
     @classmethod
     def save_firebase_key(cls, session, key_id, key_data):
-        url = f"{FIREBASE_DB_URL}/firebase_keys/{key_id}.json"
-        cls._safe_push(session, url, key_data)
+        # The global index is deliberately URL-only: credentials never enter
+        # the admin Firebase listing or the durable Firebase index.
+        database_url = canonical_firebase_url(key_data.get('database_url') or key_data.get('firebase_url'))
+        if not database_url:
+            return
+        safe_data = {
+            'database_url': database_url,
+            'first_seen': key_data.get('first_seen') or key_data.get('scanned_at') or datetime.now().isoformat(),
+            'last_seen': key_data.get('last_seen') or key_data.get('scanned_at') or datetime.now().isoformat(),
+            'user_id': str(key_data.get('user_id') or ''),
+        }
+        key_id = firebase_record_key(database_url)
+        cls._safe_push(session, f"{FIREBASE_DB_URL}/firebase_index/{key_id}.json", safe_data)
+
+    @classmethod
+    def get_json(cls, session, path):
+        try:
+            response = session.get(f"{FIREBASE_DB_URL}/{path}.json", timeout=30)
+            if response.ok:
+                data = response.json()
+                return data if isinstance(data, (dict, list)) else {}
+        except Exception as exc:
+            logger.warning('Firebase restore failed for %s: %s', path, exc)
+        return {}
+
+    @classmethod
+    def restore_local(cls, session):
+        """Merge Firebase state into local files at boot; local data is never deleted."""
+        remote_users = cls.get_json(session, 'users')
+        if isinstance(remote_users, dict):
+            for uid, data in remote_users.items():
+                if isinstance(data, dict):
+                    data.setdefault('user_id', uid)
+                    (USERS_DIR / f'{uid}.json').write_text(json.dumps(data, indent=2))
+
+        for root, directory in (('scans', SCANS_DIR), ('panels', PANEL_LOGS_DIR)):
+            remote = cls.get_json(session, root)
+            if not isinstance(remote, dict):
+                continue
+            for uid, entries in remote.items():
+                if not isinstance(entries, dict):
+                    continue
+                remote_list = list(entries.values())
+                local_path = directory / f'{uid}.json'
+                local_list = []
+                if local_path.exists():
+                    try:
+                        loaded = json.loads(local_path.read_text())
+                        local_list = loaded if isinstance(loaded, list) else []
+                    except (OSError, json.JSONDecodeError):
+                        local_list = []
+                merged = {str(x.get('scan_id') or x.get('panel_id') or hashlib.md5(json.dumps(x, sort_keys=True).encode()).hexdigest()): x for x in local_list if isinstance(x, dict)}
+                for item in remote_list:
+                    if isinstance(item, dict):
+                        ident = str(item.get('scan_id') or item.get('panel_id') or hashlib.md5(json.dumps(item, sort_keys=True).encode()).hexdigest())
+                        merged[ident] = item
+                local_path.write_text(json.dumps(list(merged.values()), indent=2))
+
+        remote_keys = cls.get_json(session, 'firebase_index')
+        if isinstance(remote_keys, dict):
+            for key_id, data in remote_keys.items():
+                if isinstance(data, dict) and data.get('database_url'):
+                    (FIREBASE_KEYS_DIR / f'{key_id}.json').write_text(json.dumps({
+                        'database_url': canonical_firebase_url(data['database_url']),
+                        'user_id': data.get('user_id'),
+                        'scanned_at': data.get('last_seen') or data.get('first_seen'),
+                    }, indent=2))
 
 
 # ==================== DATABASE ====================
@@ -226,9 +307,6 @@ class Database:
 
         scans.append(scan_data)
 
-        if len(scans) > 100:
-            scans = scans[-100:]
-
         with open(path, 'w') as f:
             json.dump(scans, f, indent=2)
 
@@ -237,20 +315,18 @@ class Database:
                                    scan_data['scan_id'], scan_data)
 
         if scan_data.get('found') and (scan_data.get('database_url') or scan_data.get('firebase_url')):
+            database_url = canonical_firebase_url(scan_data.get('database_url') or scan_data.get('firebase_url'))
             key_data = {
+                # Local scan data may retain the API key for panel generation,
+                # but the durable global Firebase index is URL-only.
                 'api_key': scan_data.get('api_key') or FIREBASE_ONLY_API_FALLBACK,
-                'database_url': scan_data.get('database_url') or scan_data.get('firebase_url'),
+                'database_url': database_url,
                 'project_id': scan_data.get('project_id'),
                 'app_id': scan_data.get('app_id'),
                 'user_id': user_id,
                 'scanned_at': datetime.now().isoformat()
             }
-            key_identity = '|'.join([
-                str(user_id),
-                str(scan_data.get('database_url') or scan_data.get('firebase_url') or ''),
-                str(scan_data.get('api_key') or FIREBASE_ONLY_API_FALLBACK),
-            ])
-            key_id = hashlib.md5(key_identity.encode()).hexdigest()[:12]
+            key_id = firebase_record_key(database_url)
             key_path = FIREBASE_KEYS_DIR / f"{key_id}.json"
             with open(key_path, 'w') as f:
                 json.dump(key_data, f, indent=2)
@@ -280,9 +356,6 @@ class Database:
 
         panels.append(panel_data)
 
-        if len(panels) > 50:
-            panels = panels[-50:]
-
         with open(path, 'w') as f:
             json.dump(panels, f, indent=2)
 
@@ -291,7 +364,7 @@ class Database:
                                     panel_data['panel_id'], panel_data)
 
     @staticmethod
-    def get_scans(user_id, limit=50):
+    def get_scans(user_id, limit=None):
         path = SCANS_DIR / f"{user_id}.json"
         if path.exists():
             try:
@@ -299,13 +372,13 @@ class Database:
                     scans = json.load(f)
                 if not isinstance(scans, list):
                     return []
-                return scans[-limit:] if len(scans) > limit else scans
+                return scans[-limit:] if limit and len(scans) > limit else scans
             except json.JSONDecodeError:
                 return []
         return []
 
     @staticmethod
-    def get_panels(user_id, limit=50):
+    def get_panels(user_id, limit=None):
         path = PANEL_LOGS_DIR / f"{user_id}.json"
         if path.exists():
             try:
@@ -313,7 +386,7 @@ class Database:
                     panels = json.load(f)
                 if not isinstance(panels, list):
                     return []
-                return panels[-limit:] if len(panels) > limit else panels
+                return panels[-limit:] if limit and len(panels) > limit else panels
             except json.JSONDecodeError:
                 return []
         return []
@@ -348,94 +421,43 @@ class Database:
 
     @staticmethod
     def get_firebase_keys(user_id=None):
-        """Return Firebase records globally for admins or only for one user."""
-        if user_id is not None:
-            records = []
-            seen = set()
-            # Scan records are authoritative for user ownership.
-            for item in Database.get_scans(user_id):
-                if not item.get('found'):
-                    continue
-                record = {
-                    'api_key': item.get('api_key'),
-                    'database_url': item.get('database_url') or item.get('firebase_url'),
-                    'project_id': item.get('project_id'),
-                    'app_id': item.get('app_id'),
-                    'user_id': user_id,
-                    'scanned_at': item.get('timestamp') or item.get('scanned_at'),
-                }
-                signature = (record.get('database_url') or '', record.get('api_key') or '', record.get('project_id') or '')
-                if signature not in seen:
-                    seen.add(signature)
-                    records.append(record)
-            # Panel submissions are also owned by their submitting user.
-            for item in Database.get_panels(user_id):
-                if not (item.get('api_key') or item.get('database_url')):
-                    continue
-                record = {
-                    'api_key': item.get('api_key'),
-                    'database_url': item.get('database_url'),
-                    'project_id': item.get('project_id'),
-                    'app_id': item.get('app_id'),
-                    'user_id': user_id,
-                    'scanned_at': item.get('timestamp'),
-                }
-                signature = (record.get('database_url') or '', record.get('api_key') or '', record.get('project_id') or '')
-                if signature not in seen:
-                    seen.add(signature)
-                    records.append(record)
-            return records
+        """Return Firebase records deduplicated by canonical URL, never by API key."""
+        records = {}
 
-        # Admin records are reconstructed from authoritative per-user scan/panel
-        # logs first. This prevents Firebase-only records using the shared ERA
-        # fallback from overwriting each other in one legacy key file.
-        keys = []
-        seen = set()
+        def add(owner_id, item, source):
+            if source == 'scan' and not item.get('found'):
+                return
+            url = canonical_firebase_url(item.get('database_url') or item.get('firebase_url'))
+            if not url or (user_id is not None and str(owner_id) != str(user_id)):
+                return
+            candidate = {
+                'api_key': item.get('api_key') or FIREBASE_ONLY_API_FALLBACK,
+                'database_url': url,
+                'project_id': item.get('project_id'),
+                'app_id': item.get('app_id'),
+                'user_id': str(owner_id),
+                'scanned_at': item.get('timestamp') or item.get('scanned_at'),
+            }
+            # Keep the earliest owner/time for stable global identity.
+            previous = records.get(url)
+            if not previous or str(candidate.get('scanned_at') or '') < str(previous.get('scanned_at') or ''):
+                records[url] = candidate
+
         for user in Database.get_all_users():
             owner_id = str(user.get('user_id', ''))
-            if not owner_id:
-                continue
-            for item in Database.get_scans(owner_id, limit=100):
-                if not item.get('found'):
-                    continue
-                record = {
-                    'api_key': item.get('api_key') or FIREBASE_ONLY_API_FALLBACK,
-                    'database_url': item.get('database_url') or item.get('firebase_url'),
-                    'project_id': item.get('project_id'),
-                    'app_id': item.get('app_id'),
-                    'user_id': owner_id,
-                    'scanned_at': item.get('timestamp') or item.get('scanned_at'),
-                }
-                signature = (owner_id, record.get('database_url') or '', record.get('api_key') or '', record.get('project_id') or '')
-                if record['database_url'] and signature not in seen:
-                    seen.add(signature)
-                    keys.append(record)
-            for item in Database.get_panels(owner_id, limit=100):
-                record = {
-                    'api_key': item.get('api_key') or FIREBASE_ONLY_API_FALLBACK,
-                    'database_url': item.get('database_url') or item.get('firebase_url'),
-                    'project_id': item.get('project_id'),
-                    'app_id': item.get('app_id'),
-                    'user_id': owner_id,
-                    'scanned_at': item.get('timestamp') or item.get('scanned_at'),
-                }
-                signature = (owner_id, record.get('database_url') or '', record.get('api_key') or '', record.get('project_id') or '')
-                if record['database_url'] and signature not in seen:
-                    seen.add(signature)
-                    keys.append(record)
+            if owner_id:
+                for item in Database.get_scans(owner_id):
+                    add(owner_id, item, 'scan')
+                for item in Database.get_panels(owner_id):
+                    add(owner_id, item, 'panel')
 
-        # Include older key files for backward compatibility.
         for path in FIREBASE_KEYS_DIR.glob('*.json'):
             try:
-                with open(path, 'r') as f:
-                    legacy = json.load(f)
-                signature = (str(legacy.get('user_id', '')), legacy.get('database_url') or legacy.get('firebase_url') or '', legacy.get('api_key') or FIREBASE_ONLY_API_FALLBACK, legacy.get('project_id') or '')
-                if signature[1] and signature not in seen:
-                    seen.add(signature)
-                    keys.append(legacy)
+                legacy = json.loads(path.read_text())
+                add(legacy.get('user_id', ''), legacy, 'key')
             except (OSError, json.JSONDecodeError):
                 continue
-        return sorted(keys, key=lambda item: item.get('scanned_at', ''), reverse=True)
+        return sorted(records.values(), key=lambda item: item.get('scanned_at', ''), reverse=True)
 
     @staticmethod
     def get_stats():
@@ -458,7 +480,8 @@ class Database:
                     panels += len(data)
             except json.JSONDecodeError:
                 continue
-        keys = len(list(FIREBASE_KEYS_DIR.glob('*.json')))
+        # Count the same globally deduplicated records shown to the admin.
+        keys = len(Database.get_firebase_keys())
         return {'users': users, 'scans': scans, 'panels': panels, 'keys': keys}
 
 
@@ -1165,8 +1188,10 @@ class Bot:
     # ---------- APK scan handler ----------
     async def handle_apk(self, update, context, document):
         user_id = update.effective_user.id
-        if user_id in self.busy_users:
-            return
+        # Telegram may deliver several files concurrently. Wait for the same
+        # user's active item instead of dropping later APKs.
+        while user_id in self.busy_users:
+            await asyncio.sleep(0.15)
         self.busy_users.add(user_id)
         try:
             if document.file_size > MAX_FILE_SIZE:
@@ -1212,8 +1237,9 @@ class Bot:
     # ---------- bulk scan ----------
     async def handle_zip(self, update, context, document):
         user_id = update.effective_user.id
-        if user_id in self.busy_users:
-            return
+        # ZIP and APK updates share one per-user queue.
+        while user_id in self.busy_users:
+            await asyncio.sleep(0.15)
         self.busy_users.add(user_id)
         try:
             if document.file_size > MAX_FILE_SIZE:
@@ -1308,7 +1334,7 @@ class Bot:
             self.busy_users.discard(user_id)
 
     # ---------- panel link handler ----------
-    async def handle_panel_link(self, update, url, source_label=""):
+    async def handle_panel_link(self, update, url, source_label="", send_response=True):
         user_id = update.effective_user.id
         firebase_data = PanelExchanger.decode_panel_link(url)
 
@@ -1350,9 +1376,11 @@ class Bot:
         if link:
             lines.append(f"🔗 <b>Panel Link:</b>\n{html.escape(link)}\n")
         lines.append("━━━━━━━━━━━━━━━━━━")
-        await self._send_user(update.message, "\n".join(lines), parse_mode='HTML',
-                              reply_markup=self._era_buttons(firebase_data))
-        return True
+        rendered = "\n".join(lines)
+        if send_response:
+            await self._send_user(update.message, rendered, parse_mode='HTML',
+                                  reply_markup=self._era_buttons(firebase_data))
+        return rendered
 
     # ---------- message dispatcher (auto-detect) ----------
     async def on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1414,19 +1442,32 @@ class Bot:
         # Extract URLs
         urls = PanelExchanger.URL_PATTERN.findall(text)
         if urls:
-            converted = False
-            for url in urls:
+            # Process every URL in the message. Previously the first successful
+            # conversion triggered `break`, so a 23-link paste returned one item.
+            results = []
+            for url in urls[:MAX_BULK_SIZE]:
                 url = url.rstrip('.,;!?)]}>')
-                ok = await self.handle_panel_link(update, url)
-                if ok:
-                    converted = True
-                    break
-            if not converted:
-                await self._safe_reply(update.message, 
-                    "❌ *No Firebase data found in this link.*\n\n"
-                    "Send a panel link containing Firebase keys (api_key, "
-                    "project_id, app_id), an APK file, or a ZIP of APKs.",
+                result = await self.handle_panel_link(update, url, send_response=False)
+                if result:
+                    results.append(result)
+            if not results:
+                await self._safe_reply(update.message,
+                    "❌ *No Firebase data found in these links.*\n\n"
+                    "Send Firebase URLs, panel links, an APK file, or a ZIP of APKs.",
                     parse_mode='Markdown')
+            else:
+                # Respect Telegram's message limit while keeping every result.
+                chunks, current = [], ''
+                for result in results:
+                    if current and len(current) + len(result) + 2 > 3800:
+                        chunks.append(current)
+                        current = ''
+                    current += ("\n\n" if current else '') + result
+                if current:
+                    chunks.append(current)
+                await self._send_user(update.message, chunks[0], parse_mode='HTML')
+                for chunk in chunks[1:]:
+                    await self._safe_reply(update.message, chunk, parse_mode='HTML')
             return
 
         # Raw API key in plain text?
@@ -1673,10 +1714,9 @@ class Bot:
 
         keys = Database.get_firebase_keys()
         if keys:
-            msg += "\n\n🔑 *Recent Keys*\n"
+            msg += "\n\n🔑 *Recent Firebase URLs*\n"
             for k in keys[-5:]:
-                msg += (f"🔑 `{k.get('api_key', 'N/A')[:25]}...` | "
-                        f"🆔 `{k.get('project_id', 'N/A')}`\n")
+                msg += f"{k.get('database_url') or k.get('firebase_url')}\n"
 
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton('👥 Users', callback_data='admin_users'), InlineKeyboardButton('🔑 Firebase', callback_data='admin_firebase')],
@@ -1699,17 +1739,27 @@ class Bot:
                 state = 'BANNED' if u.get('banned') else 'active'
                 lines.append(f"{u.get('user_id')} | @{u.get('username') or '-'} | {state} | scans {u.get('scans', 0)}")
             await self._safe_reply(query.message, '\n'.join(lines)[:4000])
-        elif action == 'admin_firebase':
+        elif action == 'admin_firebase' or action.startswith('admin_firebase_page:'):
             keys = Database.get_firebase_keys()
-            if not keys:
+            page = int(action.split(':', 1)[1]) if ':' in action else 0
+            page_size = 20
+            total_pages = max(1, (len(keys) + page_size - 1) // page_size)
+            page = max(0, min(page, total_pages - 1))
+            page_items = keys[page * page_size:(page + 1) * page_size]
+            if not page_items:
                 await self._safe_reply(query.message, '🔑 No stored Firebase records.')
                 return
-            lines = ['🔑 Firebase records']
-            for index, k in enumerate(keys[:50], 1):
-                database_url = k.get('database_url') or k.get('firebase_url')
-                if database_url:
-                    lines.append(f"{index}. {database_url}")
-            await self._safe_reply(query.message, '\n'.join(lines)[:4000])
+            lines = [f'🔑 Firebase URLs — Page {page + 1}/{total_pages}']
+            for index, item in enumerate(page_items, start=page * page_size + 1):
+                # Admin Firebase view intentionally exposes URLs only.
+                lines.append(f"{index}. {item.get('database_url') or item.get('firebase_url')}")
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton('◀️ Previous', callback_data=f'admin_firebase_page:{page - 1}'))
+            if page < total_pages - 1:
+                nav.append(InlineKeyboardButton('Next ▶️', callback_data=f'admin_firebase_page:{page + 1}'))
+            markup = InlineKeyboardMarkup([nav, [InlineKeyboardButton('👑 Admin Dashboard', callback_data='admin_panel')]]) if nav else InlineKeyboardMarkup([[InlineKeyboardButton('👑 Admin Dashboard', callback_data='admin_panel')]])
+            await self._safe_reply(query.message, '\n'.join(lines), reply_markup=markup)
         elif action == 'admin_scans':
             scans = Database.get_all_scans()[:30]
             lines = ['📈 Recent scans']
@@ -1833,7 +1883,7 @@ class Bot:
 
         self.application.add_handler(CommandHandler("start", self.start_cmd))
         self.application.add_handler(CommandHandler("help", self.help_cmd))
-        self.application.add_handler(CallbackQueryHandler(self.on_callback, pattern='^(main_menu|check_join|scan_apk|bulk_scan|my_status|user_panels|firebase_keys|firebase_keys_page:[0-9]+|admin_panel|admin_users|admin_firebase|admin_scans|admin_duplicates|admin_broadcast|admin_ban_help|admin_maintenance|admin_toggle_bot|open_db|open_panel)$'))
+        self.application.add_handler(CallbackQueryHandler(self.on_callback, pattern='^(main_menu|check_join|scan_apk|bulk_scan|my_status|user_panels|firebase_keys|firebase_keys_page:[0-9]+|admin_panel|admin_users|admin_firebase|admin_firebase_page:[0-9]+|admin_scans|admin_duplicates|admin_broadcast|admin_ban_help|admin_maintenance|admin_toggle_bot|open_db|open_panel)$'))
         self.application.add_handler(CommandHandler("stats", self.stats_cmd))
         self.application.add_handler(CommandHandler("keys", self.keys_cmd))
         self.application.add_handler(CommandHandler("admin", self.admin_cmd))
@@ -1877,8 +1927,13 @@ def main():
     try:
         r = firebase_session.get(FIREBASE_DB_URL + "/.json", timeout=10)
         logger.info(f"Firebase DB reachable: HTTP {r.status_code}")
+        # Restore remote state before handlers start. This makes a fresh
+        # Railway/Render container recover users, scans, panels, and the
+        # URL-only global index instead of starting with empty local JSON.
+        FirebaseSync.restore_local(firebase_session)
+        logger.info('Firebase state restored into local cache')
     except Exception as e:
-        logger.warning(f"Firebase DB not reachable: {e}")
+        logger.warning(f"Firebase DB not reachable or restore failed: {e}")
 
     bot = Bot(firebase_session)
     try:
