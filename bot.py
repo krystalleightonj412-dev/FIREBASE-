@@ -379,30 +379,69 @@ class FirebaseSync:
                         'scanned_at': data.get('last_seen') or data.get('first_seen'),
                     }, indent=2))
 
-        # 4) Deep Restore: Recover missing URLs from 'bot_data' and 'submissions'
-        # This recovers records that might have been lost from 'firebase_index'
-        for node, url_field, key_field, date_field in [
-            ('bot_data', 'url', 'key', 'logged_at'),
-            ('submissions', 'firebaseUrl', 'authenticationKey', 'firstAddedAt')
-        ]:
-            remote_data = cls.get_json(session, node)
-            items = remote_data.values() if isinstance(remote_data, dict) else (remote_data if isinstance(remote_data, list) else [])
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                url = item.get(url_field) or item.get('url') or item.get('firebaseUrl') or item.get('database_url')
-                if not url:
-                    continue
-                database_url = canonical_firebase_url(url)
-                key_id = firebase_record_key(database_url)
-                key_path = FIREBASE_KEYS_DIR / f'{key_id}.json'
-                if not key_path.exists():
-                    key_path.write_text(json.dumps({
-                        'database_url': database_url,
-                        'api_key': item.get(key_field) or item.get('key') or item.get('authenticationKey') or FIREBASE_ONLY_API_FALLBACK,
-                        'scanned_at': item.get(date_field) or item.get('logged_at') or item.get('date') or item.get('firstAddedAt'),
-                        'user_id': 'recovered',
-                    }, indent=2))
+        # 4) Deep Restore: Recover missing URLs from all possible nodes
+        # This recovers records from 'bot_data', 'submissions', 'scans', and 'panels'
+        # to ensure no historical data is lost.
+        found_urls = {} # database_url -> record_dict
+        
+        # Helper to collect unique URLs
+        def collect(node_name, url_fields, key_fields, date_fields):
+            remote = cls.get_json(session, node_name)
+            if not remote: return
+            
+            # Handle nested user structures (scans, panels) vs flat nodes
+            if node_name in ('scans', 'panels'):
+                user_groups = remote.values() if isinstance(remote, dict) else remote
+            else:
+                user_groups = [remote]
+                
+            for group in user_groups:
+                items = group.values() if isinstance(group, dict) else (group if isinstance(group, list) else [])
+                for item in items:
+                    if not isinstance(item, dict): continue
+                    # Extract URL
+                    url = None
+                    for f in url_fields + ['database_url', 'firebase_url', 'url', 'firebaseUrl']:
+                        url = item.get(f)
+                        if url: break
+                    if not url and 'firebase_data' in item and isinstance(item['firebase_data'], dict):
+                        url = item['firebase_data'].get('database_url')
+                    
+                    if not url: continue
+                    db_url = canonical_firebase_url(url)
+                    if db_url in found_urls: continue
+                    
+                    # Extract Key
+                    key = None
+                    for f in key_fields + ['api_key', 'key', 'authenticationKey']:
+                        key = item.get(f)
+                        if key: break
+                    if not key and 'firebase_data' in item and isinstance(item['firebase_data'], dict):
+                        key = item['firebase_data'].get('api_key')
+                        
+                    # Extract Date
+                    date = None
+                    for f in date_fields + ['scanned_at', 'logged_at', 'date', 'firstAddedAt', 'timestamp']:
+                        date = item.get(f)
+                        if date: break
+                        
+                    found_urls[db_url] = {
+                        'database_url': db_url,
+                        'api_key': str(key or FIREBASE_ONLY_API_FALLBACK),
+                        'scanned_at': str(date or datetime.now().isoformat()),
+                        'user_id': str(item.get('user_id') or 'recovered')
+                    }
+
+        collect('bot_data', ['url'], ['key'], ['logged_at', 'date'])
+        collect('submissions', ['firebaseUrl'], ['authenticationKey'], ['firstAddedAt'])
+        collect('scans', ['database_url'], ['api_key'], ['timestamp'])
+        collect('panels', ['database_url'], ['api_key'], ['timestamp'])
+
+        for db_url, record in found_urls.items():
+            key_id = firebase_record_key(db_url)
+            key_path = FIREBASE_KEYS_DIR / f'{key_id}.json'
+            if not key_path.exists():
+                key_path.write_text(json.dumps(record, indent=2))
 
         # 5) Restore Bot Settings (Admins and Channels)
         settings = cls.get_json(session, 'bot_settings')
@@ -2169,7 +2208,7 @@ class Bot:
 
         self.application.add_handler(CommandHandler("start", self.start_cmd))
         self.application.add_handler(CommandHandler("help", self.help_cmd))
-        self.application.add_handler(CallbackQueryHandler(self.on_callback, pattern='^(main_menu|check_join|scan_apk|bulk_scan|my_status|user_panels|firebase_keys|firebase_keys_page:[0-9]+|admin_panel|admin_users|admin_firebase|admin_firebase_page:[0-9]+|admin_scans|admin_duplicates|admin_broadcast|admin_ban_help|admin_maintenance|admin_toggle_bot|admin_manage_admins|open_db|open_panel)$'))
+        self.application.add_handler(CallbackQueryHandler(self.on_callback, pattern='^(main_menu|check_join|scan_apk|bulk_scan|my_status|user_panels|firebase_keys|firebase_keys_page:[0-9]+|admin_panel|admin_users|admin_firebase|admin_firebase_page:[0-9]+|admin_scans|admin_duplicates|admin_broadcast|admin_ban_help|admin_maintenance|admin_toggle_bot|admin_manage_admins|admin_add_channel|open_db|open_panel)$'))
         self.application.add_handler(CommandHandler("stats", self.stats_cmd))
         self.application.add_handler(CommandHandler("keys", self.keys_cmd))
         self.application.add_handler(CommandHandler("admin", self.admin_cmd))
