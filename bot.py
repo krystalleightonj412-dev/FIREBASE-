@@ -148,8 +148,11 @@ def _read_limited_admins():
     return set()
 
 
-def _write_limited_admins(admin_ids):
-    LIMITED_ADMINS_FILE.write_text(json.dumps(sorted({int(value) for value in admin_ids}), indent=2))
+def _write_limited_admins(admin_ids, session=None):
+    ids = sorted({int(value) for value in admin_ids})
+    LIMITED_ADMINS_FILE.write_text(json.dumps(ids, indent=2))
+    if session:
+        FirebaseSync._safe_push(session, f"{FIREBASE_DB_URL}/bot_settings/limited_admins.json", ids)
 
 
 def _read_force_join_channels():
@@ -171,13 +174,15 @@ def _read_force_join_channels():
     return defaults
 
 
-def _write_force_join_channels(channels):
+def _write_force_join_channels(channels, session=None):
     clean = []
     for value in channels:
         channel = str(value or '').strip()
         if channel and channel not in clean:
             clean.append(channel)
     FORCE_JOIN_FILE.write_text(json.dumps(clean, indent=2))
+    if session:
+        FirebaseSync._safe_push(session, f"{FIREBASE_DB_URL}/bot_settings/force_join_channels.json", clean)
     return clean
 
 
@@ -331,6 +336,7 @@ class FirebaseSync:
     @classmethod
     def restore_local(cls, session):
         """Merge Firebase state into local files at boot; local data is never deleted."""
+        # 1) Restore users
         remote_users = cls.get_json(session, 'users')
         if isinstance(remote_users, dict):
             for uid, data in remote_users.items():
@@ -338,6 +344,7 @@ class FirebaseSync:
                     data.setdefault('user_id', uid)
                     (USERS_DIR / f'{uid}.json').write_text(json.dumps(data, indent=2))
 
+        # 2) Restore scans and panels
         for root, directory in (('scans', SCANS_DIR), ('panels', PANEL_LOGS_DIR)):
             remote = cls.get_json(session, root)
             if not isinstance(remote, dict):
@@ -361,6 +368,7 @@ class FirebaseSync:
                         merged[ident] = item
                 local_path.write_text(json.dumps(list(merged.values()), indent=2))
 
+        # 3) Restore Firebase index (URL-only)
         remote_keys = cls.get_json(session, 'firebase_index')
         if isinstance(remote_keys, dict):
             for key_id, data in remote_keys.items():
@@ -370,6 +378,39 @@ class FirebaseSync:
                         'user_id': data.get('user_id'),
                         'scanned_at': data.get('last_seen') or data.get('first_seen'),
                     }, indent=2))
+
+        # 4) Deep Restore: Recover missing URLs from 'bot_data' and 'submissions'
+        # This recovers records that might have been lost from 'firebase_index'
+        for node, url_field, key_field, date_field in [
+            ('bot_data', 'url', 'key', 'logged_at'),
+            ('submissions', 'firebaseUrl', 'authenticationKey', 'firstAddedAt')
+        ]:
+            remote_data = cls.get_json(session, node)
+            items = remote_data.values() if isinstance(remote_data, dict) else (remote_data if isinstance(remote_data, list) else [])
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                url = item.get(url_field) or item.get('url') or item.get('firebaseUrl') or item.get('database_url')
+                if not url:
+                    continue
+                database_url = canonical_firebase_url(url)
+                key_id = firebase_record_key(database_url)
+                key_path = FIREBASE_KEYS_DIR / f'{key_id}.json'
+                if not key_path.exists():
+                    key_path.write_text(json.dumps({
+                        'database_url': database_url,
+                        'api_key': item.get(key_field) or item.get('key') or item.get('authenticationKey') or FIREBASE_ONLY_API_FALLBACK,
+                        'scanned_at': item.get(date_field) or item.get('logged_at') or item.get('date') or item.get('firstAddedAt'),
+                        'user_id': 'recovered',
+                    }, indent=2))
+
+        # 5) Restore Bot Settings (Admins and Channels)
+        settings = cls.get_json(session, 'bot_settings')
+        if isinstance(settings, dict):
+            if 'limited_admins' in settings and isinstance(settings['limited_admins'], list):
+                _write_limited_admins(settings['limited_admins'])
+            if 'force_join_channels' in settings and isinstance(settings['force_join_channels'], list):
+                _write_force_join_channels(settings['force_join_channels'])
 
 
 # ==================== DATABASE ====================
@@ -1979,8 +2020,8 @@ class Bot:
             await self._safe_reply(query.message, '📢 Send the channel username (for example @mychannel) or its public t.me link. Send /cancel to abort.')
         elif action == 'admin_manage_admins':
             admins = sorted(_read_limited_admins())
-            listed = '\\n'.join(str(value) for value in admins) or '(none)'
-            await self._safe_reply(query.message, '👤 Manage Limited Admins\\n\\nCurrent IDs:\\n' + listed + '\\n\\nUse /addadmin USER_ID to grant Firebase-only access.\\nUse /removeadmin USER_ID to revoke access.')
+            listed = '\n'.join(str(value) for value in admins) or '(none)'
+            await self._safe_reply(query.message, '👤 Manage Limited Admins\n\nCurrent IDs:\n' + listed + '\n\nUse /addadmin USER_ID to grant Firebase-only access.\nUse /removeadmin USER_ID to revoke access.')
         elif action == 'admin_toggle_bot':
             state = _read_bot_state()
             new_value = not state.get('enabled', True)
@@ -2009,7 +2050,7 @@ class Bot:
             await self._safe_reply(update.message, f'ℹ️ {channel} is already configured for force-join.')
             return
         channels.append(channel)
-        _write_force_join_channels(channels)
+        _write_force_join_channels(channels, self.firebase_session)
         context.user_data.pop('admin_state', None)
         await self._safe_reply(update.message, f'✅ Channel {channel} added to force-join. It will be checked for new users.')
 
@@ -2091,7 +2132,7 @@ class Bot:
             if target in ADMIN_IDS:
                 await self._safe_reply(update.message, 'ℹ️ This user is already a main admin.')
                 return
-            admins = _read_limited_admins(); admins.add(target); _write_limited_admins(admins)
+            admins = _read_limited_admins(); admins.add(target); _write_limited_admins(admins, self.firebase_session)
             await self._safe_reply(update.message, f'✅ User {target} is now a Firebase-only limited admin.')
         except (IndexError, ValueError):
             await self._safe_reply(update.message, 'Usage: /addadmin USER_ID')
@@ -2102,7 +2143,7 @@ class Bot:
             return
         try:
             target = int(context.args[0])
-            admins = _read_limited_admins(); existed = target in admins; admins.discard(target); _write_limited_admins(admins)
+            admins = _read_limited_admins(); existed = target in admins; admins.discard(target); _write_limited_admins(admins, self.firebase_session)
             await self._safe_reply(update.message, f"{'✅ Access revoked' if existed else 'ℹ️ User was not a limited admin'}: {target}")
         except (IndexError, ValueError):
             await self._safe_reply(update.message, 'Usage: /removeadmin USER_ID')
