@@ -110,6 +110,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_STATE_FILE = ADMIN_DIR / 'bot_state.json'
+LIMITED_ADMINS_FILE = ADMIN_DIR / 'limited_admins.json'
+FORCE_JOIN_FILE = ADMIN_DIR / 'force_join_channels.json'
+# Firebase Manager uses the existing HTML app's `submissions` node. These
+# settings default to the bot's primary Realtime Database and can be overridden
+# without changing the Manager HTML.
+FIREBASE_MANAGER_URL = ''
+FIREBASE_MANAGER_AUTH = ''
 
 def _read_bot_state():
     default = {'enabled': True, 'maintenance': False, 'updated_at': None}
@@ -128,6 +135,50 @@ def _write_bot_state(**changes):
     state['updated_at'] = datetime.now().isoformat()
     BOT_STATE_FILE.write_text(json.dumps(state, indent=2))
     return state
+
+
+def _read_limited_admins():
+    try:
+        if LIMITED_ADMINS_FILE.exists():
+            data = json.loads(LIMITED_ADMINS_FILE.read_text())
+            if isinstance(data, list):
+                return {int(value) for value in data}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        logger.warning('Could not read limited admins: %s', exc)
+    return set()
+
+
+def _write_limited_admins(admin_ids):
+    LIMITED_ADMINS_FILE.write_text(json.dumps(sorted({int(value) for value in admin_ids}), indent=2))
+
+
+def _read_force_join_channels():
+    """Return configured force-join channels, preserving the two defaults."""
+    defaults = list(FORCE_JOIN_CHANNELS)
+    try:
+        if FORCE_JOIN_FILE.exists():
+            data = json.loads(FORCE_JOIN_FILE.read_text())
+            if isinstance(data, list):
+                channels = []
+                for value in data:
+                    channel = str(value or '').strip()
+                    if channel and channel not in channels:
+                        channels.append(channel)
+                if channels:
+                    return channels
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        logger.warning('Could not read force-join channels: %s', exc)
+    return defaults
+
+
+def _write_force_join_channels(channels):
+    clean = []
+    for value in channels:
+        channel = str(value or '').strip()
+        if channel and channel not in clean:
+            clean.append(channel)
+    FORCE_JOIN_FILE.write_text(json.dumps(clean, indent=2))
+    return clean
 
 
 def canonical_firebase_url(value):
@@ -187,6 +238,84 @@ class FirebaseSync:
         }
         key_id = firebase_record_key(database_url)
         cls._safe_push(session, f"{FIREBASE_DB_URL}/firebase_index/{key_id}.json", safe_data)
+        # The HTML Manager is unchanged; mirror this unique URL into its
+        # deterministic `submissions/<hash>` record as well.
+        cls.sync_manager_submission(session, {**key_data, **safe_data})
+
+    @classmethod
+    def _manager_request_url(cls, path):
+        base = (FIREBASE_MANAGER_URL or FIREBASE_DB_URL).rstrip('/')
+        url = f"{base}/{path.strip('/')}.json"
+        if FIREBASE_MANAGER_AUTH:
+            url += f"?auth={quote(str(FIREBASE_MANAGER_AUTH), safe='')}"
+        return url
+
+    @classmethod
+    def sync_manager_submission(cls, session, key_data):
+        """Upsert one unique URL into the unchanged Manager HTML `submissions` node."""
+        database_url = canonical_firebase_url(key_data.get('database_url') or key_data.get('firebase_url'))
+        if not database_url:
+            return False
+        # Check the complete Manager registry first. This protects against
+        # legacy/random IDs as well as the deterministic ID used by the bot.
+        # Existing URLs are intentionally skipped: one URL must create one
+        # Manager record and repeated sightings must not rewrite it.
+        try:
+            registry_response = session.get(cls._manager_request_url('submissions'), timeout=20)
+            registry = registry_response.json() if registry_response.ok else {}
+            if isinstance(registry, dict):
+                for record in registry.values():
+                    if isinstance(record, dict) and canonical_firebase_url(record.get('firebaseUrl')) == database_url:
+                        return False
+        except Exception as exc:
+            logger.warning('Firebase Manager registry check failed for %s: %s', database_url, exc)
+            # Fail closed: do not write when existence cannot be verified.
+            return False
+
+        record_id = hashlib.sha256(database_url.encode('utf-8')).hexdigest()
+        path = f"submissions/{record_id}"
+        now = datetime.now().isoformat()
+        existing = {}
+        first_added = key_data.get('first_seen') or key_data.get('scanned_at') or now
+        last_seen = now
+        daily = existing.get('dailyCounts') if isinstance(existing.get('dailyCounts'), dict) else {}
+        day = now[:10]
+        daily[day] = int(daily.get(day, 0) or 0) + 1
+        payload = {
+            'firebaseUrl': database_url,
+            'authenticationKey': str(key_data.get('api_key') or key_data.get('authenticationKey') or FIREBASE_ONLY_API_FALLBACK),
+            'firstAddedAt': first_added,
+            'lastSeenAt': last_seen,
+            'submitCount': 1,
+            'dailyCounts': {day: 1},
+        }
+        try:
+            response = session.put(cls._manager_request_url(path), json=payload, timeout=15)
+            if not response.ok:
+                logger.warning('Firebase Manager write failed: HTTP %s', response.status_code)
+                return False
+            return True
+        except Exception as exc:
+            logger.warning('Firebase Manager write failed for %s: %s', database_url, exc)
+            return False
+
+    @classmethod
+    def sync_manager_from_local(cls, session):
+        """Backfill only missing Manager records from local canonical keys."""
+        existing = cls.get_json(session, 'submissions')
+        existing = existing if isinstance(existing, dict) else {}
+        synced = 0
+        for key_path in FIREBASE_KEYS_DIR.glob('*.json'):
+            record_id = key_path.stem
+            if record_id in existing:
+                continue
+            try:
+                data = json.loads(key_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict) and cls.sync_manager_submission(session, data):
+                synced += 1
+        return synced
 
     @classmethod
     def get_json(cls, session, path):
@@ -362,6 +491,14 @@ class Database:
         if firebase_session is not None:
             FirebaseSync.save_panel(firebase_session, user_id,
                                     panel_data['panel_id'], panel_data)
+            panel_url = panel_data.get('database_url') or panel_data.get('firebase_url')
+            if panel_url:
+                FirebaseSync.save_firebase_key(firebase_session, firebase_record_key(panel_url), {
+                    'database_url': panel_url,
+                    'api_key': panel_data.get('api_key') or panel_data.get('authenticationKey') or FIREBASE_ONLY_API_FALLBACK,
+                    'user_id': user_id,
+                    'scanned_at': panel_data.get('timestamp'),
+                })
 
     @staticmethod
     def get_scans(user_id, limit=None):
@@ -1080,7 +1217,13 @@ class Bot:
         return sent
 
     def _is_admin(self, user_id):
-        return user_id in ADMIN_IDS
+        return int(user_id) in ADMIN_IDS
+
+    def _is_limited_admin(self, user_id):
+        return int(user_id) in _read_limited_admins() and not self._is_admin(user_id)
+
+    def _is_any_admin(self, user_id):
+        return self._is_admin(user_id) or self._is_limited_admin(user_id)
 
     async def _safe_reply(self, msg, text, **kwargs):
         """Reply with formatting first, then retry as clean plain text."""
@@ -1102,7 +1245,7 @@ class Bot:
         if self._is_admin(user_id):
             return []
         missing = []
-        for channel in FORCE_JOIN_CHANNELS:
+        for channel in _read_force_join_channels():
             try:
                 member = await context.bot.get_chat_member(channel, user_id)
                 status = str(getattr(member, "status", "")).lower()
@@ -1131,12 +1274,14 @@ class Bot:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         missing = await self._missing_force_channels(update, context)
         buttons = []
-        channel_labels = {
-            "@eraXarmy": ("📢 Join ERA X Army", "https://t.me/eraXarmy"),
-            "@eraXearning": ("💰 Join ERA X Earning", "https://t.me/eraXearning"),
-        }
         for channel in missing:
-            label, url = channel_labels[channel]
+            if str(channel).startswith('http://') or str(channel).startswith('https://'):
+                url = str(channel)
+                label = f"📢 Join {url.rsplit('/', 1)[-1] or 'Channel'}"
+            else:
+                username = str(channel).lstrip('@')
+                url = f"https://t.me/{username}"
+                label = f"📢 Join @{username}"
             buttons.append([InlineKeyboardButton(label, url=url)])
         buttons.append([InlineKeyboardButton("✅ I Joined — Check Again", callback_data="check_join")])
         keyboard = InlineKeyboardMarkup(buttons)
@@ -1427,6 +1572,9 @@ class Bot:
         if self._is_admin(user_id) and context.user_data.get('admin_state') == 'broadcast':
             await self.broadcast_message(update, context)
             return
+        if self._is_admin(user_id) and context.user_data.get('admin_state') == 'add_channel':
+            await self.add_channel_message(update, context)
+            return
         user_data = Database.get_user(user_id)
         user_data['username'] = user.username
         user_data['first_name'] = user.first_name
@@ -1518,7 +1666,7 @@ class Bot:
             [             InlineKeyboardButton('📊 My Status', callback_data='my_status'),
              InlineKeyboardButton('🔗 Panel', callback_data='user_panels')],
         ]
-        if getattr(msg, 'from_user', None) and msg.from_user.id in ADMIN_IDS:
+        if getattr(msg, 'from_user', None) and self._is_any_admin(msg.from_user.id):
             rows.append([InlineKeyboardButton('👑 Admin Panel', callback_data='admin_panel')])
         rows.append([InlineKeyboardButton('🏠 Main Menu', callback_data='main_menu')])
         keyboard = InlineKeyboardMarkup(rows)
@@ -1704,8 +1852,16 @@ class Bot:
     async def admin_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         msg_target = update.message or update.callback_query.message
-        if not self._is_admin(user_id):
+        if not self._is_any_admin(user_id):
             await self._safe_reply(msg_target, "⛔ You are not authorized!")
+            return
+
+        if self._is_limited_admin(user_id):
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton('🔑 Firebase', callback_data='admin_firebase')],
+                [InlineKeyboardButton('🏠 Main Menu', callback_data='main_menu')]
+            ])
+            await self._safe_reply(msg_target, '🔑 Limited Admin Panel\\n\\nYou have access only to Firebase URL records.', reply_markup=keyboard)
             return
 
         stats = Database.get_stats()
@@ -1746,14 +1902,20 @@ class Bot:
             [InlineKeyboardButton('📈 All Scans', callback_data='admin_scans'), InlineKeyboardButton('♻️ Duplicates', callback_data='admin_duplicates')],
             [InlineKeyboardButton('📣 Broadcast', callback_data='admin_broadcast')],
             [InlineKeyboardButton('🚫 Ban / Unban', callback_data='admin_ban_help')],
-            [InlineKeyboardButton('🛠️ Maintenance', callback_data='admin_maintenance'), InlineKeyboardButton('⏻ Bot ON/OFF', callback_data='admin_toggle_bot')]
+            [InlineKeyboardButton('🛠️ Maintenance', callback_data='admin_maintenance'), InlineKeyboardButton('⏻ Bot ON/OFF', callback_data='admin_toggle_bot')],
+            [InlineKeyboardButton('👤 Manage Admins', callback_data='admin_manage_admins')],
+            [InlineKeyboardButton('📢 Add Channel', callback_data='admin_add_channel')]
         ])
         await self._safe_reply(msg_target, msg, reply_markup=keyboard)
 
     async def admin_action(self, update, context, action):
         query = update.callback_query
-        if not self._is_admin(update.effective_user.id):
+        user_id = update.effective_user.id
+        if not self._is_any_admin(user_id):
             await self._safe_reply(query.message, '⛔ Admin only.')
+            return
+        if self._is_limited_admin(user_id) and action not in {'admin_firebase'} and not action.startswith('admin_firebase_page:'):
+            await self._safe_reply(query.message, '⛔ Main admin access only.')
             return
         if action == 'admin_users':
             users = Database.get_all_users()
@@ -1809,12 +1971,47 @@ class Bot:
             _write_bot_state(maintenance=new_value)
             await self._safe_reply(query.message, f"🛠️ Maintenance mode {'ENABLED' if new_value else 'DISABLED'}.\nNormal users will {'see a maintenance notice' if new_value else 'be served normally'}.")
             await self.admin_cmd(update, context)
+        elif action == 'admin_add_channel':
+            if not self._is_admin(user_id):
+                await self._safe_reply(query.message, '⛔ Main admin access only.')
+                return
+            context.user_data['admin_state'] = 'add_channel'
+            await self._safe_reply(query.message, '📢 Send the channel username (for example @mychannel) or its public t.me link. Send /cancel to abort.')
+        elif action == 'admin_manage_admins':
+            admins = sorted(_read_limited_admins())
+            listed = '\\n'.join(str(value) for value in admins) or '(none)'
+            await self._safe_reply(query.message, '👤 Manage Limited Admins\\n\\nCurrent IDs:\\n' + listed + '\\n\\nUse /addadmin USER_ID to grant Firebase-only access.\\nUse /removeadmin USER_ID to revoke access.')
         elif action == 'admin_toggle_bot':
             state = _read_bot_state()
             new_value = not state.get('enabled', True)
             _write_bot_state(enabled=new_value)
             await self._safe_reply(query.message, f"⏻ Bot is now {'ON' if new_value else 'OFF'}.\nAdmins can still access the control panel.")
             await self.admin_cmd(update, context)
+
+    async def add_channel_message(self, update, context):
+        """Accept a public @username or t.me URL from a main admin."""
+        if not self._is_admin(update.effective_user.id):
+            context.user_data.pop('admin_state', None)
+            await self._safe_reply(update.message, '⛔ Main admin access only.')
+            return
+        raw = (update.message.text or '').strip()
+        channel = raw
+        if raw.startswith('https://t.me/') or raw.startswith('http://t.me/'):
+            channel = '@' + raw.rstrip('/').split('/')[-1].split('?', 1)[0]
+        elif raw.startswith('t.me/'):
+            channel = '@' + raw.rstrip('/').split('/')[-1].split('?', 1)[0]
+        if not re.fullmatch(r'@[A-Za-z0-9_]{5,32}', channel):
+            await self._safe_reply(update.message, '❌ Invalid channel. Send a public username like @mychannel or a public https://t.me/mychannel link.')
+            return
+        channels = _read_force_join_channels()
+        if channel in channels:
+            context.user_data.pop('admin_state', None)
+            await self._safe_reply(update.message, f'ℹ️ {channel} is already configured for force-join.')
+            return
+        channels.append(channel)
+        _write_force_join_channels(channels)
+        context.user_data.pop('admin_state', None)
+        await self._safe_reply(update.message, f'✅ Channel {channel} added to force-join. It will be checked for new users.')
 
     async def broadcast_message(self, update, context):
         if not self._is_admin(update.effective_user.id):
@@ -1885,6 +2082,31 @@ class Bot:
                 logger.warning('dedupe failed for %s: %s', path, exc)
         await self._safe_reply(update.message, f'♻️ Duplicate cleanup complete. Removed: {removed}.')
 
+    async def addadmin_cmd(self, update, context):
+        if not self._is_admin(update.effective_user.id):
+            await self._safe_reply(update.message, '⛔ Main admin access only.')
+            return
+        try:
+            target = int(context.args[0])
+            if target in ADMIN_IDS:
+                await self._safe_reply(update.message, 'ℹ️ This user is already a main admin.')
+                return
+            admins = _read_limited_admins(); admins.add(target); _write_limited_admins(admins)
+            await self._safe_reply(update.message, f'✅ User {target} is now a Firebase-only limited admin.')
+        except (IndexError, ValueError):
+            await self._safe_reply(update.message, 'Usage: /addadmin USER_ID')
+
+    async def removeadmin_cmd(self, update, context):
+        if not self._is_admin(update.effective_user.id):
+            await self._safe_reply(update.message, '⛔ Main admin access only.')
+            return
+        try:
+            target = int(context.args[0])
+            admins = _read_limited_admins(); existed = target in admins; admins.discard(target); _write_limited_admins(admins)
+            await self._safe_reply(update.message, f"{'✅ Access revoked' if existed else 'ℹ️ User was not a limited admin'}: {target}")
+        except (IndexError, ValueError):
+            await self._safe_reply(update.message, 'Usage: /removeadmin USER_ID')
+
     async def cancel_cmd(self, update, context):
         context.user_data.pop('admin_state', None)
         await self._safe_reply(update.message, '✅ Cancelled.')
@@ -1906,7 +2128,7 @@ class Bot:
 
         self.application.add_handler(CommandHandler("start", self.start_cmd))
         self.application.add_handler(CommandHandler("help", self.help_cmd))
-        self.application.add_handler(CallbackQueryHandler(self.on_callback, pattern='^(main_menu|check_join|scan_apk|bulk_scan|my_status|user_panels|firebase_keys|firebase_keys_page:[0-9]+|admin_panel|admin_users|admin_firebase|admin_firebase_page:[0-9]+|admin_scans|admin_duplicates|admin_broadcast|admin_ban_help|admin_maintenance|admin_toggle_bot|open_db|open_panel)$'))
+        self.application.add_handler(CallbackQueryHandler(self.on_callback, pattern='^(main_menu|check_join|scan_apk|bulk_scan|my_status|user_panels|firebase_keys|firebase_keys_page:[0-9]+|admin_panel|admin_users|admin_firebase|admin_firebase_page:[0-9]+|admin_scans|admin_duplicates|admin_broadcast|admin_ban_help|admin_maintenance|admin_toggle_bot|admin_manage_admins|open_db|open_panel)$'))
         self.application.add_handler(CommandHandler("stats", self.stats_cmd))
         self.application.add_handler(CommandHandler("keys", self.keys_cmd))
         self.application.add_handler(CommandHandler("admin", self.admin_cmd))
@@ -1914,6 +2136,8 @@ class Bot:
         self.application.add_handler(CommandHandler("unban", self.unban_cmd))
         self.application.add_handler(CommandHandler("broadcast", self.broadcast_cmd))
         self.application.add_handler(CommandHandler("cancel", self.cancel_cmd))
+        self.application.add_handler(CommandHandler("addadmin", self.addadmin_cmd))
+        self.application.add_handler(CommandHandler("removeadmin", self.removeadmin_cmd))
         self.application.add_handler(CommandHandler("dedupe", self.dedupe_cmd))
 
         # Auto-detect: documents (APK/ZIP) and text (panel links)
@@ -1936,11 +2160,13 @@ def main():
         load_dotenv()
     except ImportError:
         pass
-    global BOT_TOKEN, ADMIN_IDS, FIREBASE_DB_URL
+    global BOT_TOKEN, ADMIN_IDS, FIREBASE_DB_URL, FIREBASE_MANAGER_URL, FIREBASE_MANAGER_AUTH
     BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
     ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x]
     FIREBASE_DB_URL = os.environ.get(
         "FIREBASE_DATABASE_URL", "https://era-ka-store-default-rtdb.firebaseio.com")
+    FIREBASE_MANAGER_URL = os.environ.get("FIREBASE_MANAGER_URL", FIREBASE_DB_URL).rstrip('/')
+    FIREBASE_MANAGER_AUTH = os.environ.get("FIREBASE_MANAGER_AUTH", os.environ.get("FIREBASE_API_KEY", ""))
 
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         logger.error("BOT_TOKEN is not set! Set the BOT_TOKEN environment variable.")
@@ -1955,6 +2181,8 @@ def main():
         # URL-only global index instead of starting with empty local JSON.
         FirebaseSync.restore_local(firebase_session)
         logger.info('Firebase state restored into local cache')
+        synced = FirebaseSync.sync_manager_from_local(firebase_session)
+        logger.info('Firebase Manager backfill complete: %s missing records added', synced)
     except Exception as e:
         logger.warning(f"Firebase DB not reachable or restore failed: {e}")
 
