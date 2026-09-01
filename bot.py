@@ -1418,13 +1418,21 @@ class Bot:
                 return None
 
     async def _safe_edit(self, msg, text, **kwargs):
-        """Edit a progress message without letting Telegram errors kill a job."""
+        """Edit a message safely, falling back to plain text if formatting is rejected."""
         try:
             return await self._telegram_call(
-                lambda: msg.edit_text(text, **kwargs), 'Telegram progress edit')
+                lambda: msg.edit_text(text, **kwargs), 'Telegram message edit')
         except Exception as exc:
-            logger.debug('progress edit skipped: %s', exc)
-            return None
+            logger.debug('formatted message edit failed; retrying plain text: %s', exc)
+            safe_kwargs = dict(kwargs)
+            safe_kwargs.pop('parse_mode', None)
+            try:
+                return await self._telegram_call(
+                    lambda: msg.edit_text(self._plain_text(text), **safe_kwargs),
+                    'Telegram plain message edit')
+            except Exception as final_exc:
+                logger.debug('message edit skipped: %s', final_exc)
+                return None
 
     async def _safe_delete(self, msg):
         """Delete a progress message best-effort."""
