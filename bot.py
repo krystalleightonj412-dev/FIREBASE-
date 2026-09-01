@@ -34,6 +34,7 @@ import base64
 import hashlib
 import html
 import logging
+import uuid
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote, quote
@@ -41,6 +42,7 @@ from urllib.parse import urlparse, parse_qs, unquote, quote
 import requests as req_lib
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.request import HTTPXRequest
+from telegram.error import RetryAfter, TimedOut, NetworkError
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -56,7 +58,14 @@ FIREBASE_ONLY_API_FALLBACK = "ERA"
 FORCE_JOIN_CHANNELS = ("@eraXarmy", "@eraXearning")
 MAX_BULK_SIZE = 50
 MAX_FILE_SIZE = 50 * 1024 * 1024
+MAX_BULK_UNCOMPRESSED_SIZE = 250 * 1024 * 1024
+MAX_CONCURRENT_SCANS = 2
 DOWNLOAD_TIMEOUT = 60
+STATUS_CACHE_TTL = 45
+APK_SCAN_TIMEOUT = 150
+MAX_TELEGRAM_RETRIES = 4
+_STATUS_CACHE = {}
+_STATUS_CACHE_LOCK = __import__('threading').RLock()
 
 # Telegram custom emoji IDs supplied by the owner. The list contains 35 entries,
 # with one repeated ID; unique IDs are mapped in source-order and any unmapped
@@ -101,6 +110,23 @@ TEMP_DIR = DATA_DIR / "temp"
 for dir_path in [DATA_DIR, USERS_DIR, SCANS_DIR, BULK_DIR, SESSIONS_DIR,
                  ADMIN_DIR, FIREBASE_KEYS_DIR, PANEL_LOGS_DIR, TEMP_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
+
+def cleanup_stale_temp_files(max_age_seconds=3600):
+    """Remove abandoned scan files after a process crash or forced restart."""
+    cutoff = time.time() - max_age_seconds
+    removed = 0
+    for path in TEMP_DIR.iterdir():
+        try:
+            if path.stat().st_mtime < cutoff:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink(missing_ok=True)
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        logger.info('Removed %s stale temporary scan artifacts', removed)
 
 # Logging
 logging.basicConfig(
@@ -379,9 +405,9 @@ class FirebaseSync:
                         'scanned_at': data.get('last_seen') or data.get('first_seen'),
                     }, indent=2))
 
-        # 4) Deep Restore: Recover missing URLs from all possible nodes
-        # This recovers records from 'bot_data', 'submissions', 'scans', and 'panels'
-        # to ensure no historical data is lost.
+        # 4) Deep Restore: recover bot-owned historical URLs only.
+        # Manager submissions are deliberately NOT read here: synchronization is
+        # strictly Bot -> Manager and must never backfill bot records from Manager.
         found_urls = {} # database_url -> record_dict
         
         # Helper to collect unique URLs
@@ -433,7 +459,6 @@ class FirebaseSync:
                     }
 
         collect('bot_data', ['url'], ['key'], ['logged_at', 'date'])
-        collect('submissions', ['firebaseUrl'], ['authenticationKey'], ['firstAddedAt'])
         collect('scans', ['database_url'], ['api_key'], ['timestamp'])
         collect('panels', ['database_url'], ['api_key'], ['timestamp'])
 
@@ -1258,6 +1283,40 @@ class Bot:
         self.firebase_session = firebase_session
         self.busy_users = set()
         self.user_last_message_ids = {}
+        self.background_tasks = set()
+        # Bound CPU/RAM/disk pressure when many APK jobs arrive together.
+        self.scan_slots = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+
+    def _track_task(self, coroutine, label):
+        """Keep fire-and-forget tasks observable and consume their exceptions."""
+        task = asyncio.create_task(coroutine, name=label)
+        self.background_tasks.add(task)
+        def finished(done):
+            self.background_tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                error = done.exception()
+            except Exception as exc:
+                logger.warning('%s completion could not be inspected: %s', label, exc)
+                return
+            if error:
+                logger.error('%s failed: %s', label, error, exc_info=error)
+        task.add_done_callback(finished)
+        return task
+
+    async def _restore_background(self):
+        """Restore state after polling starts; a slow Firebase cannot block getUpdates."""
+        try:
+            await asyncio.to_thread(FirebaseSync.restore_local, self.firebase_session)
+            logger.info('Firebase state restored into local cache')
+            synced = await asyncio.to_thread(FirebaseSync.sync_manager_from_local, self.firebase_session)
+            logger.info('Firebase Manager backfill complete: %s missing records added', synced)
+        except Exception as exc:
+            logger.warning('Background Firebase restore failed: %s', exc)
+
+    async def _post_init(self, application):
+        self._track_task(self._restore_background(), 'firebase-startup-restore')
 
     async def _clear_user_message(self, msg):
         """Delete the previous tracked bot message for a normal user, if possible."""
@@ -1305,15 +1364,71 @@ class Bot:
     def _is_any_admin(self, user_id):
         return self._is_admin(user_id) or self._is_limited_admin(user_id)
 
+    async def _telegram_call(self, operation, label='Telegram request'):
+        """Run one Telegram operation with bounded RetryAfter/network backoff."""
+        delay = 1.0
+        for attempt in range(MAX_TELEGRAM_RETRIES):
+            try:
+                return await operation()
+            except RetryAfter as exc:
+                wait_for = min(max(float(getattr(exc, 'retry_after', 1)), 1.0), 30.0)
+                logger.warning('%s rate-limited; retrying in %.1fs', label, wait_for)
+                await asyncio.sleep(wait_for)
+            except (TimedOut, NetworkError) as exc:
+                if attempt == MAX_TELEGRAM_RETRIES - 1:
+                    raise
+                logger.warning('%s transient failure (%s); retrying in %.1fs', label, exc, delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 8.0)
+        raise RuntimeError(f'{label} failed after retries')
+
     async def _safe_reply(self, msg, text, **kwargs):
         """Reply with formatting first, then retry as clean plain text."""
         try:
-            return await msg.reply_text(text, **kwargs)
+            return await self._telegram_call(
+                lambda: msg.reply_text(text, **kwargs), 'Telegram reply')
         except Exception as exc:
             logger.warning('formatted Telegram reply failed; retrying plain text: %s', exc)
             safe_kwargs = dict(kwargs)
             safe_kwargs.pop('parse_mode', None)
-            return await msg.reply_text(self._plain_text(text), **safe_kwargs)
+            try:
+                return await self._telegram_call(
+                    lambda: msg.reply_text(self._plain_text(text), **safe_kwargs),
+                    'Telegram plain reply')
+            except Exception as final_exc:
+                logger.error('Telegram reply dropped after retries: %s', final_exc)
+                return None
+
+    async def _safe_edit(self, msg, text, **kwargs):
+        """Edit a progress message without letting Telegram errors kill a job."""
+        try:
+            return await self._telegram_call(
+                lambda: msg.edit_text(text, **kwargs), 'Telegram progress edit')
+        except Exception as exc:
+            logger.debug('progress edit skipped: %s', exc)
+            return None
+
+    async def _safe_delete(self, msg):
+        """Delete a progress message best-effort."""
+        try:
+            return await msg.delete()
+        except Exception as exc:
+            logger.debug('progress delete skipped: %s', exc)
+            return None
+
+    @staticmethod
+    def _cleanup_path(path):
+        """Remove a file or directory without masking the original scan error."""
+        if not path:
+            return
+        try:
+            candidate = Path(path)
+            if candidate.is_dir():
+                shutil.rmtree(candidate, ignore_errors=True)
+            else:
+                candidate.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning('temporary cleanup failed for %s: %s', path, exc)
 
     async def _send(self, msg, text, **kwargs):
         """Send safely; custom emoji is optional and never blocks delivery."""
@@ -1405,6 +1520,182 @@ class Bot:
                 continue
         return False
 
+    @staticmethod
+    def _firebase_status_probe(database_url, api_key=None):
+        """Probe a detected RTDB without downloading its full root.
+
+        This is intentionally conservative: a reachable database is ACTIVE, but
+        Online/Offline counts are reported only when a recognizable users node
+        and presence/connections node are available. Unknown schemas never get
+        guessed counts.
+        """
+        result = {'state': 'DEACTIVATED', 'online': None, 'offline': None, 'total': None}
+        url = canonical_firebase_url(database_url)
+        if not url:
+            return result
+        cache_key = (url, str(api_key or '').strip())
+        with _STATUS_CACHE_LOCK:
+            cached = _STATUS_CACHE.get(cache_key)
+            if cached and time.monotonic() - cached[0] < STATUS_CACHE_TTL:
+                return dict(cached[1])
+        auth = str(api_key or '').strip()
+
+        def finish(value):
+            with _STATUS_CACHE_LOCK:
+                _STATUS_CACHE[cache_key] = (time.monotonic(), dict(value))
+            return value
+        query = ('?auth=' + quote(auth, safe='')) if auth and auth != FIREBASE_ONLY_API_FALLBACK else ''
+        try:
+            health = req_lib.get(url + '/.json' + query, params={'shallow': 'true'}, timeout=8)
+            if health.status_code in (401, 403, 404):
+                return finish(result)
+            if not health.ok:
+                result['state'] = 'UNAVAILABLE'
+                return finish(result)
+            result['state'] = 'ACTIVE'
+            try:
+                root_nodes = health.json()
+            except (ValueError, TypeError):
+                root_nodes = {}
+
+            def shallow_count(node):
+                response = req_lib.get(url + '/' + node + '.json' + query,
+                                       params={'shallow': 'true'}, timeout=6)
+                if not response.ok:
+                    return None
+                value = response.json()
+                if isinstance(value, (dict, list)):
+                    return len(value)
+                return 0 if value is None else None
+
+            def record_and_status_counts(value, scalar_map_status=False):
+                """Count actual nested records and boolean-like status markers.
+
+                A shallow count can count folders/groups rather than devices. A
+                record is therefore identified by an id/status field or by a
+                leaf mapping of scalar values. Wrapper metadata is traversed,
+                not counted. This keeps the probe useful for nested `clients`
+                schemas without downloading or displaying record contents.
+                """
+                online = 0
+                status_seen = 0
+                total = 0
+                truthy = {'online', 'connected', 'active', '1', 'true', 'yes', 'on'}
+                falsy = {'offline', 'disconnected', 'inactive', '0', 'false', 'no', 'off'}
+                fields = ('online', 'isOnline', 'connected', 'active', 'status', 'state')
+                identity_fields = {
+                    'id', 'uid', 'user_id', 'userid', 'client_id', 'clientid',
+                    'device_id', 'deviceid', 'mobile', 'mobno', 'phone', 'number'
+                }
+
+                def scalar(value):
+                    return isinstance(value, (bool, int, float, str))
+
+                def walk(node):
+                    nonlocal online, status_seen, total
+                    if isinstance(node, list):
+                        for child in node:
+                            walk(child)
+                        return
+                    if not isinstance(node, dict):
+                        return
+
+                    marker = None
+                    marker_key = None
+                    for field in fields:
+                        if field in node and scalar(node[field]):
+                            marker = str(node[field]).strip().lower()
+                            marker_key = field
+                            break
+                    child_values = list(node.values())
+                    has_nested = any(isinstance(child, (dict, list)) for child in child_values)
+                    lower_keys = {str(key).strip().lower() for key in node}
+                    looks_like_record = bool(marker_key) or bool(lower_keys & identity_fields)
+                    if not looks_like_record and not has_nested:
+                        # A common Firebase shape is {record_id: true/false}
+                        # for users/presence. The mapping itself is a folder;
+                        # each scalar child is one record/status marker.
+                        if len(node) > 1 and all(scalar(child) for child in child_values):
+                            for child in child_values:
+                                total += 1
+                                marker_value = str(child).strip().lower()
+                                if scalar_map_status and (marker_value in truthy or marker_value in falsy):
+                                    status_seen += 1
+                                    if marker_value in truthy:
+                                        online += 1
+                            return
+                        looks_like_record = bool(node)
+
+                    if looks_like_record:
+                        total += 1
+                        if marker is not None:
+                            status_seen += 1
+                            if marker in truthy:
+                                online += 1
+                        return
+
+                    for child in child_values:
+                        walk(child)
+
+                walk(value)
+                return total, status_seen, online
+
+            # Prefer the actual device/client collection. Use a recursive
+            # record count because shallow child count may count nested groups.
+            preferred_nodes = ('clients', 'members', 'accounts', 'profiles', 'users', 'devices')
+            if isinstance(root_nodes, dict):
+                available = {str(key).strip().lower() for key in root_nodes}
+                discovered = tuple(node for node in preferred_nodes if node in available)
+                candidate_nodes = discovered or preferred_nodes
+            else:
+                candidate_nodes = preferred_nodes
+            for node in candidate_nodes:
+                try:
+                    response = req_lib.get(url + '/' + node + '.json' + query, timeout=8)
+                    if not response.ok:
+                        continue
+                    total, seen, online = record_and_status_counts(response.json())
+                    if total <= 0:
+                        continue
+                    result['total'] = total
+                    if seen:
+                        result['online'] = min(online, total)
+                        result['offline'] = total - result['online']
+                        break
+                    # If this collection has no per-record status, use a
+                    # dedicated presence collection as the online source.
+                    for presence_node in ('presence', 'connections', 'onlineUsers', 'online_users', 'online'):
+                        presence_response = req_lib.get(url + '/' + presence_node + '.json' + query, timeout=6)
+                        if not presence_response.ok:
+                            continue
+                        presence_total, _, _ = record_and_status_counts(
+                            presence_response.json(), scalar_map_status=True
+                        )
+                        if presence_total > 0:
+                            result['online'] = min(presence_total, total)
+                            result['offline'] = total - result['online']
+                            break
+                    break
+                except (req_lib.RequestException, ValueError, TypeError):
+                    continue
+        except (req_lib.RequestException, ValueError, TypeError) as exc:
+            logger.info('Firebase status probe unavailable for %s: %s', url, exc)
+            result['state'] = 'UNAVAILABLE'
+        except Exception as exc:
+            logger.warning('Unexpected Firebase status probe error: %s', exc)
+            result['state'] = 'UNAVAILABLE'
+        return finish(result)
+
+    def _attach_firebase_status(self, data):
+        """Attach a short-lived status result without failing the scan."""
+        if not isinstance(data, dict):
+            return data
+        database_url = PanelExchanger._db_url_of(data)
+        if database_url:
+            data['status_summary'] = self._firebase_status_probe(
+                database_url, data.get('api_key'))
+        return data
+
     def _format_era_result(self, data, apk_name=None):
         """Build a safe HTML result with Telegram custom-emoji entities."""
         lines = []
@@ -1419,6 +1710,15 @@ class Bot:
         # Credentials are intentionally shown only in this immediate scan result.
         lines.append(f"{custom_emoji('🌐')} <b>Firebase URL</b>\n{db_url}")
         lines.append(f"{custom_emoji('🎆')} <b>API Key</b>\n{api_key}")
+        summary = data.get('status_summary') or {}
+        state = str(summary.get('state') or 'UNAVAILABLE')
+        state_label = 'ACTIVE' if state == 'ACTIVE' else ('FIREBASE DEACTIVATED' if state == 'DEACTIVATED' else 'STATUS UNAVAILABLE')
+        online = summary.get('online')
+        offline = summary.get('offline')
+        total = summary.get('total')
+        fmt = lambda value: str(value) if value is not None else 'Unavailable'
+        lines.append(f"🟢 <b>Status:</b> {html.escape(state_label)}")
+        lines.append(f"👥 <b>Online:</b> {fmt(online)}\n⚫ <b>Offline:</b> {fmt(offline)}\n📊 <b>Total:</b> {fmt(total)}")
         link = PanelExchanger.generate_encoded_link(data)
         if link:
             lines.append(f"{custom_emoji('🔗')} <b>Panel Link:</b>\n{html.escape(link)}")
@@ -1436,149 +1736,162 @@ class Bot:
     # ---------- APK scan handler ----------
     async def handle_apk(self, update, context, document):
         user_id = update.effective_user.id
-        # Telegram may deliver several files concurrently. Wait for the same
-        # user's active item instead of dropping later APKs.
         while user_id in self.busy_users:
             await asyncio.sleep(0.15)
         self.busy_users.add(user_id)
+        slot_acquired = False
+        dest = None
+        status = None
+        scanner = None
         try:
-            if document.file_size > MAX_FILE_SIZE:
+            await self.scan_slots.acquire()
+            slot_acquired = True
+            if (document.file_size or 0) > MAX_FILE_SIZE:
                 await self._safe_reply(update.message, "❌ File too large (max 50MB).")
                 return
             status = await self._send_user(update.message, "⬇️ Downloading APK...")
-            try:
-                user_file = await context.bot.get_file(document.file_id)
-                file_name = document.file_name or "file.apk"
-                if not file_name.lower().endswith('.apk'):
-                    file_name += ".apk"
-                dest = TEMP_DIR / file_name
-                await user_file.download_to_drive(str(dest))
-
-                await status.edit_text("🔍 Scanning APK for Firebase keys...")
-                loop = asyncio.get_event_loop()
-                scan_data, scanner = await loop.run_in_executor(
-                    None, self._scan_apk_sync, dest, user_id,
-                    update.effective_user.username)
-                if scanner.temp_dir and scanner.temp_dir.exists():
-                    shutil.rmtree(scanner.temp_dir, ignore_errors=True)
-                dest.unlink(missing_ok=True)
-
-                if scan_data.get('found'):
-                    await self._clear_user_message(update.message)
-                    await self._send_user(
-                        update.message,
-                        self._format_era_result(scan_data),
-                        parse_mode='HTML',
-                        reply_markup=self._era_buttons(scan_data))
-                else:
-                    await self._clear_user_message(update.message)
-                    await self._send_user(
-                        update.message,
-                        "❌ No Firebase config found in this APK.")
-                await status.delete()
-            except Exception as e:
-                logger.error(f"APK scan error: {e}")
-                await status.edit_text(f"❌ Error scanning APK: {e}")
+            user_file = await asyncio.wait_for(
+                context.bot.get_file(document.file_id), timeout=DOWNLOAD_TIMEOUT)
+            file_name = document.file_name or "file.apk"
+            if not file_name.lower().endswith('.apk'):
+                file_name += ".apk"
+            safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', Path(file_name).name)
+            dest = TEMP_DIR / f"apk_{user_id}_{uuid.uuid4().hex}_{safe_name}"
+            await asyncio.wait_for(
+                user_file.download_to_drive(str(dest)), timeout=DOWNLOAD_TIMEOUT)
+            await self._safe_edit(status, "🔍 Scanning APK for Firebase keys...")
+            scan_data, scanner = await asyncio.wait_for(
+                asyncio.to_thread(self._scan_apk_sync, dest, user_id,
+                                  update.effective_user.username),
+                timeout=APK_SCAN_TIMEOUT)
+            if scan_data.get('found'):
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._attach_firebase_status, scan_data), timeout=12)
+                await self._clear_user_message(update.message)
+                await self._send_user(update.message, self._format_era_result(scan_data),
+                                      parse_mode='HTML', reply_markup=self._era_buttons(scan_data))
+            else:
+                await self._clear_user_message(update.message)
+                await self._send_user(update.message, "❌ No Firebase config found in this APK.")
+            await self._safe_delete(status)
+        except asyncio.TimeoutError:
+            logger.warning('APK job timed out for user %s', user_id)
+            if status:
+                await self._safe_edit(status, "❌ APK scan timed out; the temporary file was cleaned.")
+        except Exception as exc:
+            logger.exception('APK scan failed for user %s: %s', user_id, exc)
+            if status:
+                await self._safe_edit(status, "❌ APK scan failed. Please try again with a smaller file.")
         finally:
+            if scanner is not None:
+                self._cleanup_path(scanner.temp_dir)
+            self._cleanup_path(dest)
+            if slot_acquired:
+                self.scan_slots.release()
             self.busy_users.discard(user_id)
 
     # ---------- bulk scan ----------
     async def handle_zip(self, update, context, document):
         user_id = update.effective_user.id
-        # ZIP and APK updates share one per-user queue.
         while user_id in self.busy_users:
             await asyncio.sleep(0.15)
         self.busy_users.add(user_id)
+        slot_acquired = False
+        dest = None
+        status = None
         try:
-            if document.file_size > MAX_FILE_SIZE:
+            await self.scan_slots.acquire()
+            slot_acquired = True
+            if (document.file_size or 0) > MAX_FILE_SIZE:
                 await self._safe_reply(update.message, "❌ File too large (max 50MB).")
                 return
-            status = await self._safe_reply(update.message, "⬇️ Downloading ZIP...")
-            try:
-                user_file = await context.bot.get_file(document.file_id)
-                dest = TEMP_DIR / f"bulk_{user_id}_{int(time.time())}.zip"
-                await user_file.download_to_drive(str(dest))
-
-                await status.edit_text("📦 Extracting ZIP...")
-                extract_dir = TEMP_DIR / f"bulk_{user_id}_{int(time.time())}"
-                extract_dir.mkdir(parents=True, exist_ok=True)
-                with zipfile.ZipFile(dest, 'r') as zf:
-                    names = [n for n in zf.namelist()
-                             if n.lower().endswith('.apk')
-                             and not n.startswith('__')]
-                if not names:
-                    await status.edit_text("❌ No APK files found in the ZIP.")
+            status = await self._send_user(update.message, "⬇️ Downloading ZIP...")
+            user_file = await asyncio.wait_for(
+                context.bot.get_file(document.file_id), timeout=DOWNLOAD_TIMEOUT)
+            dest = TEMP_DIR / f"bulk_{user_id}_{uuid.uuid4().hex}.zip"
+            await asyncio.wait_for(
+                user_file.download_to_drive(str(dest)), timeout=DOWNLOAD_TIMEOUT)
+            await self._safe_edit(status, "📦 Inspecting ZIP safely...")
+            with zipfile.ZipFile(dest, 'r') as zf:
+                infos = [info for info in zf.infolist()
+                         if not info.is_dir() and info.filename.lower().endswith('.apk')
+                         and not info.filename.startswith('__')]
+                total_uncompressed = sum(max(0, int(info.file_size)) for info in infos)
+                if total_uncompressed > MAX_BULK_UNCOMPRESSED_SIZE:
+                    await self._safe_edit(status, "❌ ZIP contents are too large to process safely.")
                     return
-                if len(names) > MAX_BULK_SIZE:
-                    names = names[:MAX_BULK_SIZE]
-                    await status.edit_text(
-                        f"⚠️ More than {MAX_BULK_SIZE} APKs found, "
-                        f"scanning only the first {MAX_BULK_SIZE}."
-                    )
-                else:
-                    await status.edit_text(
-                        f"📦 Found {len(names)} APKs. Starting scan..."
-                    )
-
-                results = []
-                with zipfile.ZipFile(dest, 'r') as zf:
-                    for idx, name in enumerate(names, 1):
-                        await status.edit_text(
-                            f"🔍 Scanning {idx}/{len(names)}...")
-                        try:
-                            data = zf.read(name)
-                        except Exception:
+                names = [info.filename for info in infos[:MAX_BULK_SIZE]]
+            if not names:
+                await self._safe_edit(status, "❌ No APK files found in the ZIP.")
+                return
+            await self._safe_edit(status, f"📦 Found {len(names)} APKs. Starting scan...")
+            results = []
+            skipped = 0
+            last_progress_edit = 0.0
+            with zipfile.ZipFile(dest, 'r') as zf:
+                for idx, name in enumerate(names, 1):
+                    now = time.monotonic()
+                    if idx == 1 or idx == len(names) or now - last_progress_edit >= 2.0:
+                        await self._safe_edit(status, f"🔍 Scanning {idx}/{len(names)}...")
+                        last_progress_edit = now
+                    apk_path = TEMP_DIR / f"bulk_{user_id}_{uuid.uuid4().hex}.apk"
+                    scanner = None
+                    try:
+                        info = zf.getinfo(name)
+                        if info.file_size > MAX_FILE_SIZE:
+                            skipped += 1
                             continue
-                        apk_path = TEMP_DIR / f"bulk_{user_id}_{Path(name).name}"
-                        with open(apk_path, 'wb') as f:
-                            f.write(data)
-                        loop = asyncio.get_event_loop()
-                        scan_data, scanner = await loop.run_in_executor(
-                            None, self._scan_apk_sync, apk_path, user_id,
-                            update.effective_user.username)
-                        if scanner.temp_dir and scanner.temp_dir.exists():
-                            shutil.rmtree(scanner.temp_dir, ignore_errors=True)
-                        apk_path.unlink(missing_ok=True)
+                        with zf.open(info, 'r') as source, open(apk_path, 'wb') as target:
+                            shutil.copyfileobj(source, target, length=1024 * 1024)
+                        scan_data, scanner = await asyncio.wait_for(
+                            asyncio.to_thread(self._scan_apk_sync, apk_path, user_id,
+                                              update.effective_user.username),
+                            timeout=APK_SCAN_TIMEOUT)
                         if scan_data.get('found'):
-                            results.append((name, scanner.get_panel_link()))
-                        await asyncio.sleep(0.1)
+                            results.append((name, PanelExchanger.generate_encoded_link(scan_data)))
+                    except asyncio.TimeoutError:
+                        skipped += 1
+                        logger.warning('ZIP APK timed out: %s', name)
+                    except Exception as exc:
+                        skipped += 1
+                        logger.warning('ZIP APK failed %s: %s', name, exc)
+                    finally:
+                        if scanner is not None:
+                            self._cleanup_path(scanner.temp_dir)
+                        self._cleanup_path(apk_path)
+                    await asyncio.sleep(0.1)
 
-                dest.unlink(missing_ok=True)
-
-                if not results:
-                    await status.edit_text(
-                        "✅ *Bulk Scan Complete*\n\n"
-                        "No Firebase keys found in any APK.",
-                        parse_mode='Markdown'
-                    )
-                    return
-
-                chunks = []
-                current = "📦 *Bulk Scan Results*\n\n"
-                count = 0
-                for name, link in results:
-                    line = f"✅ `{Path(name).name}`\n{link}\n\n"
-                    if len(current) + len(line) > 3800:
-                        chunks.append(current)
-                        current = ""
-                    current += line
-                    count += 1
-                if current:
+            if not results:
+                await self._safe_edit(status, "✅ Bulk scan complete — no Firebase keys found.")
+                return
+            chunks = []
+            current = "📦 *Bulk Scan Results*\n\n"
+            for name, link in results:
+                line = f"✅ `{Path(name).name}`\n{link}\n\n"
+                if len(current) + len(line) > 3800:
                     chunks.append(current)
-
-                for chunk in chunks:
-                    await self._send(update.message, chunk, parse_mode='Markdown')
-                    await asyncio.sleep(0.3)
-
-                await status.edit_text(
-                    f"✅ *Bulk scan complete*\n🔍 Scanned: {len(names)}\n"
-                    f"✅ Found keys: {count}",
-                    parse_mode='Markdown'
-                )
-            except Exception as e:
-                logger.error(f"ZIP scan error: {e}")
-                await status.edit_text(f"❌ Error during bulk scan: {e}")
+                    current = ""
+                current += line
+            if current:
+                chunks.append(current)
+            for chunk in chunks:
+                await self._send(update.message, chunk, parse_mode='Markdown')
+                await asyncio.sleep(0.4)
+            await self._safe_edit(status,
+                f"✅ *Bulk scan complete*\n🔍 Scanned: {len(names)}\n"
+                f"✅ Found keys: {len(results)}\n⚠️ Skipped: {skipped}", parse_mode='Markdown')
+        except asyncio.TimeoutError:
+            logger.warning('ZIP download timed out for user %s', user_id)
+            if status:
+                await self._safe_edit(status, "❌ ZIP download timed out; temporary files were cleaned.")
+        except Exception as exc:
+            logger.exception('ZIP scan failed for user %s: %s', user_id, exc)
+            if status:
+                await self._safe_edit(status, "❌ Bulk scan failed; temporary files were cleaned.")
         finally:
+            self._cleanup_path(dest)
+            if slot_acquired:
+                self.scan_slots.release()
             self.busy_users.discard(user_id)
 
     # ---------- panel link handler ----------
@@ -1602,10 +1915,16 @@ class Bot:
             'user_id': user_id,
         }
         # Persist asynchronously; never make the user wait for Firebase/network I/O.
-        asyncio.create_task(asyncio.to_thread(
-            Database.save_panel, user_id, panel_record, self.firebase_session))
+        self._track_task(asyncio.to_thread(
+            Database.save_panel, user_id, panel_record, self.firebase_session),
+            'panel-persistence')
 
         # Immediate conversion result includes credentials, while the saved Panel view remains private.
+        # Status probing is bounded and off the event loop; failure only yields Unavailable.
+        try:
+            await asyncio.wait_for(asyncio.to_thread(self._attach_firebase_status, firebase_data), timeout=10)
+        except asyncio.TimeoutError:
+            firebase_data['status_summary'] = {'state': 'UNAVAILABLE', 'online': None, 'offline': None, 'total': None}
         # Duplicate lookup is local-only and is kept off the event loop.
         try:
             dup = await asyncio.wait_for(
@@ -1620,6 +1939,12 @@ class Bot:
         api_key = html.escape(str(firebase_data.get('api_key') or FIREBASE_ONLY_API_FALLBACK))
         lines.append(f"🌐 <b>Firebase URL</b>\n{db_url}\n")
         lines.append(f"🎆 <b>API Key</b>\n{api_key}\n")
+        summary = firebase_data.get('status_summary') or {}
+        state = str(summary.get('state') or 'UNAVAILABLE')
+        state_label = 'ACTIVE' if state == 'ACTIVE' else ('FIREBASE DEACTIVATED' if state == 'DEACTIVATED' else 'STATUS UNAVAILABLE')
+        fmt = lambda value: str(value) if value is not None else 'Unavailable'
+        lines.append(f"🟢 <b>Status:</b> {html.escape(state_label)}\n")
+        lines.append(f"👥 <b>Online:</b> {fmt(summary.get('online'))}\n⚫ <b>Offline:</b> {fmt(summary.get('offline'))}\n📊 <b>Total:</b> {fmt(summary.get('total'))}\n")
         link = PanelExchanger.generate_encoded_link(firebase_data)
         if link:
             lines.append(f"🔗 <b>Panel Link:</b>\n{html.escape(link)}\n")
@@ -1661,7 +1986,8 @@ class Bot:
         user_data['last_name'] = user.last_name
         await asyncio.to_thread(Database.save_user, user_id, user_data)
         if self.firebase_session:
-            asyncio.create_task(asyncio.to_thread(FirebaseSync.save_user, self.firebase_session, user_id, user_data))
+            self._track_task(asyncio.to_thread(FirebaseSync.save_user, self.firebase_session, user_id, user_data),
+                             'user-persistence')
 
         # 1) Document: APK or ZIP
         doc = update.message.document
@@ -2101,11 +2427,16 @@ class Bot:
             if Database.is_banned(uid) or uid in ADMIN_IDS:
                 continue
             try:
-                await context.bot.copy_message(chat_id=uid, from_chat_id=update.effective_chat.id, message_id=update.message.message_id)
+                await self._telegram_call(
+                    lambda uid=uid: context.bot.copy_message(
+                        chat_id=uid, from_chat_id=update.effective_chat.id,
+                        message_id=update.message.message_id),
+                    'broadcast copy')
                 delivered += 1
-                await asyncio.sleep(0.05)
-            except Exception:
+                await asyncio.sleep(0.12)
+            except Exception as exc:
                 failed += 1
+                logger.warning('broadcast delivery failed for %s: %s', uid, exc)
         context.user_data.pop('admin_state', None)
         await self._safe_reply(update.message, f'📣 Broadcast complete. Delivered: {delivered}, failed: {failed}.')
 
@@ -2204,6 +2535,7 @@ class Bot:
                             .token(BOT_TOKEN)
                             .request(telegram_request)
                             .get_updates_request(telegram_request)
+                            .post_init(self._post_init)
                             .build())
 
         self.application.add_handler(CommandHandler("start", self.start_cmd))
@@ -2252,19 +2584,16 @@ def main():
         logger.error("BOT_TOKEN is not set! Set the BOT_TOKEN environment variable.")
         return
 
+    cleanup_stale_temp_files()
     firebase_session = req_lib.Session()
+    # Do not perform the full restore synchronously here. The bot starts polling
+    # immediately and _post_init schedules restore in a supervised background task.
+    # This prevents a slow Firebase/API response from looking like a Railway crash.
     try:
-        r = firebase_session.get(FIREBASE_DB_URL + "/.json", timeout=10)
-        logger.info(f"Firebase DB reachable: HTTP {r.status_code}")
-        # Restore remote state before handlers start. This makes a fresh
-        # Railway/Render container recover users, scans, panels, and the
-        # URL-only global index instead of starting with empty local JSON.
-        FirebaseSync.restore_local(firebase_session)
-        logger.info('Firebase state restored into local cache')
-        synced = FirebaseSync.sync_manager_from_local(firebase_session)
-        logger.info('Firebase Manager backfill complete: %s missing records added', synced)
-    except Exception as e:
-        logger.warning(f"Firebase DB not reachable or restore failed: {e}")
+        r = firebase_session.get(FIREBASE_DB_URL + "/.json", timeout=5)
+        logger.info('Firebase DB reachability check: HTTP %s', r.status_code)
+    except Exception as exc:
+        logger.warning('Firebase DB reachability check failed; polling will continue: %s', exc)
 
     bot = Bot(firebase_session)
     try:
