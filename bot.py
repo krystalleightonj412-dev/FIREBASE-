@@ -59,6 +59,8 @@ FORCE_JOIN_CHANNELS = ("@eraXarmy", "@eraXearning")
 MAX_BULK_SIZE = 50
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_BULK_UNCOMPRESSED_SIZE = 250 * 1024 * 1024
+MAX_TEXT_ENTRY_SIZE = 4 * 1024 * 1024
+RAW_SCAN_CHUNK_SIZE = 2 * 1024 * 1024
 MAX_CONCURRENT_SCANS = 2
 DOWNLOAD_TIMEOUT = 60
 STATUS_CACHE_TTL = 45
@@ -774,30 +776,42 @@ class FirebaseScanner:
         }
 
     def scan(self):
-        # Fast path: raw bytes and APK text resources cover normal Firebase configs.
-        self._extract_python_strings()
-        if not self.data['found']:
+        # Search small, high-signal config entries before touching arbitrary APK bytes.
+        try:
             self._extract_from_zip()
-        # External decompilers are optional and can add tens of seconds. Do not
-        # invoke them in the normal request path; raw/ZIP extraction is bounded.
-        if self.temp_dir and self.temp_dir.exists():
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
-        return self.data
+            if not self.data['found']:
+                self._extract_python_strings()
+            return self.data
+        finally:
+            # This is defensive for future decompiler paths and interrupted scans.
+            if self.temp_dir and self.temp_dir.exists():
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
+            self.temp_dir = None
 
     def _extract_python_strings(self):
-        """Extract printable strings from the raw APK bytes (no external tool needed)."""
+        """Extract strings in bounded chunks; never materialize a whole APK in RAM."""
         try:
+            overlap = 128 * 1024
+            carry = b''
             with open(self.apk_path, 'rb') as f:
-                raw = f.read()
-            # UTF-8 printable runs
-            text8 = re.sub(rb'[\x00-\x08\x0e-\x1f\x7f-\xff]', b' ', raw).decode('ascii', errors='ignore')
-            self._find_patterns(text8)
-            # UTF-16LE printable runs (common in Android resource tables)
-            text16 = raw.decode('utf-16-le', errors='ignore')
-            text16 = re.sub(r'[\x00-\x08\x0e-\x1f\x7f-\x9f]', ' ', text16)
-            self._find_patterns(text16)
-            if self.data['found']:
-                self.data['method'] = self.data.get('method') or 'raw_strings'
+                while True:
+                    chunk = f.read(RAW_SCAN_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    raw = carry + chunk
+                    text8 = re.sub(rb'[\x00-\x08\x0e-\x1f\x7f-\xff]', b' ', raw).decode('ascii', errors='ignore')
+                    self._find_patterns(text8)
+                    if self.data['found']:
+                        self.data['method'] = self.data.get('method') or 'raw_strings'
+                        return
+                    # UTF-16 scanning is also bounded and keeps only a small overlap.
+                    text16 = raw.decode('utf-16-le', errors='ignore')
+                    text16 = re.sub(r'[\x00-\x08\x0e-\x1f\x7f-\x9f]', ' ', text16)
+                    self._find_patterns(text16)
+                    if self.data['found']:
+                        self.data['method'] = self.data.get('method') or 'raw_strings'
+                        return
+                    carry = raw[-overlap:]
         except Exception as e:
             logger.error(f"raw strings error: {e}")
 
@@ -814,7 +828,11 @@ class FirebaseScanner:
                     if not (is_gs or is_text or is_assets_config):
                         continue
                     try:
-                        content = apk.read(name).decode('utf-8', errors='ignore')
+                        info = apk.getinfo(name)
+                        if info.file_size > MAX_TEXT_ENTRY_SIZE:
+                            continue
+                        with apk.open(info, 'r') as entry:
+                            content = entry.read(MAX_TEXT_ENTRY_SIZE + 1).decode('utf-8', errors='ignore')
                     except Exception:
                         continue
                     if lower.endswith('.json'):
