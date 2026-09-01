@@ -31,6 +31,7 @@ import subprocess
 import asyncio
 import time
 import base64
+import binascii
 import hashlib
 import html
 import logging
@@ -1043,6 +1044,29 @@ class PanelExchanger:
                 raw_data['found'] = True
                 return raw_data
 
+            # Zenith format: ?zenithm=<base64(base64(JSON list of {url,key}))>.
+            # Use the first valid account because one Telegram result represents one Firebase.
+            if 'zenithm' in query:
+                try:
+                    nested = query['zenithm'][0]
+                    for _ in range(2):
+                        nested = base64.b64decode(
+                            nested.replace('-', '+').replace('_', '/') +
+                            '=' * ((4 - len(nested) % 4) % 4)
+                        ).decode('utf-8')
+                    accounts = json.loads(nested)
+                    if isinstance(accounts, list):
+                        for account in accounts:
+                            if not isinstance(account, dict) or not account.get('url'):
+                                continue
+                            firebase_data['database_url'] = str(account['url']).strip()
+                            firebase_data['api_key'] = str(account.get('key') or FIREBASE_ONLY_API_FALLBACK).strip()
+                            firebase_data['project_id'] = firebase_data['database_url'].split('//', 1)[-1].split('.', 1)[0]
+                            firebase_data['found'] = True
+                            return firebase_data
+                except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
+                    pass
+
             # Current ERA X panel format: ?share=<URL-safe base64 JSON>.
             # Keep accepting the legacy ?s=<DB_URL|||API_KEY> links.
             if 'share' in query:
@@ -1063,8 +1087,25 @@ class PanelExchanger:
 
             if 's' in query:
                 encoded = query['s'][0]
+                # ZXKAI format: url-safe base64 of JSON {u:url,k:key,l:label},
+                # XOR-obfuscated with the public panel compatibility key.
                 try:
-                    decoded = base64.b64decode(encoded).decode('utf-8')
+                    padded = encoded.replace('-', '+').replace('_', '/')
+                    padded += '=' * ((4 - len(padded) % 4) % 4)
+                    raw = base64.b64decode(padded)
+                    xor_key = b'ZXKAIv1_Xk9mP2wN7qL4vR6jH3cF8yT1ZbE5sA09'
+                    decoded_bytes = bytes(value ^ xor_key[index % len(xor_key)] for index, value in enumerate(raw))
+                    record = json.loads(decoded_bytes.decode('utf-8'))
+                    if isinstance(record, dict) and record.get('u') and record.get('k'):
+                        firebase_data['database_url'] = str(record['u']).strip()
+                        firebase_data['api_key'] = str(record['k']).strip()
+                        firebase_data['project_id'] = firebase_data['database_url'].split('//', 1)[-1].split('.', 1)[0]
+                        firebase_data['found'] = True
+                        return firebase_data
+                except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
+                    pass
+                try:
+                    decoded = base64.b64decode(encoded + '=' * ((4 - len(encoded) % 4) % 4)).decode('utf-8')
                 except Exception:
                     return firebase_data
                 parts = [p.strip() for p in decoded.split('|||') if p.strip()]
@@ -1090,6 +1131,38 @@ class PanelExchanger:
                 # Fallback: treat whole decoded string as a single payload
                 firebase_data = PanelExchanger._parse_firebase_data(decoded)
                 if firebase_data.get('found'):
+                    return firebase_data
+
+            # Generic safe fallback for unknown panels: inspect only small query values
+            # and up to three base64 layers. This handles plain/nested encoded URLs,
+            # but intentionally cannot break unknown encryption without its key.
+            embedded_candidates = []
+            for query_values in query.values():
+                for original in query_values:
+                    candidate = unquote(str(original)).strip()
+                    if not candidate or len(candidate) > 8192:
+                        continue
+                    embedded_candidates.append(candidate)
+                    for _ in range(3):
+                        try:
+                            normalized = candidate.replace('-', '+').replace('_', '/')
+                            normalized += '=' * ((4 - len(normalized) % 4) % 4)
+                            decoded_bytes = base64.b64decode(normalized, validate=False)
+                            decoded_text = decoded_bytes.decode('utf-8').strip()
+                            if not decoded_text or decoded_text == candidate or len(decoded_text) > 8192:
+                                break
+                            embedded_candidates.append(decoded_text)
+                            candidate = decoded_text
+                        except (ValueError, UnicodeDecodeError, binascii.Error):
+                            break
+            for candidate in embedded_candidates:
+                extracted = PanelExchanger._parse_firebase_data(candidate)
+                if extracted.get('database_url'):
+                    for field in ('database_url', 'api_key', 'project_id', 'app_id',
+                                  'storage_bucket', 'auth_domain', 'sender_id'):
+                        if extracted.get(field) and not firebase_data.get(field):
+                            firebase_data[field] = extracted[field]
+                    firebase_data['found'] = True
                     return firebase_data
 
             for key in query:
@@ -1591,6 +1664,9 @@ class Bot:
         query = ('?auth=' + quote(auth, safe='')) if auth and auth != FIREBASE_ONLY_API_FALLBACK else ''
         try:
             health = req_lib.get(url + '/.json' + query, params={'shallow': 'true'}, timeout=8)
+            if health.status_code == 423:
+                result['state'] = 'DEACTIVATED'
+                return finish(result)
             if health.status_code in (401, 403, 404):
                 return finish(result)
             if not health.ok:
