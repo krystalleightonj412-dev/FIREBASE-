@@ -1505,6 +1505,22 @@ class Bot:
             f"{custom_emoji('⚡')} Join only the channel button(s) shown below, then check again.",
             parse_mode="HTML", reply_markup=keyboard)
 
+    async def _enrich_status_message(self, message, data):
+        """Probe status after the fast result is delivered, then edit best-effort."""
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(self._attach_firebase_status, data), timeout=10)
+            await self._safe_edit(
+                message,
+                self._format_era_result(data, data.get('apk_name')),
+                parse_mode='HTML',
+                reply_markup=self._era_buttons(data),
+            )
+        except asyncio.TimeoutError:
+            logger.info('status enrichment timed out; leaving fast result unchanged')
+        except Exception as exc:
+            logger.info('status enrichment skipped: %s', exc)
+
     # ---------- scan core ----------
     def _scan_apk_sync(self, apk_path, user_id, username=None):
         scanner = FirebaseScanner(apk_path)
@@ -1547,7 +1563,9 @@ class Bot:
         and presence/connections node are available. Unknown schemas never get
         guessed counts.
         """
-        result = {'state': 'DEACTIVATED', 'online': None, 'offline': None, 'total': None}
+        # Unknown means the probe could not establish liveness; it is not Offline
+        # and must not be rendered as Unavailable to the user.
+        result = {'state': 'UNKNOWN', 'online': None, 'offline': None, 'total': None}
         url = canonical_firebase_url(database_url)
         if not url:
             return result
@@ -1568,7 +1586,6 @@ class Bot:
             if health.status_code in (401, 403, 404):
                 return finish(result)
             if not health.ok:
-                result['state'] = 'UNAVAILABLE'
                 return finish(result)
             result['state'] = 'ACTIVE'
             try:
@@ -1698,10 +1715,8 @@ class Bot:
                     continue
         except (req_lib.RequestException, ValueError, TypeError) as exc:
             logger.info('Firebase status probe unavailable for %s: %s', url, exc)
-            result['state'] = 'UNAVAILABLE'
         except Exception as exc:
             logger.warning('Unexpected Firebase status probe error: %s', exc)
-            result['state'] = 'UNAVAILABLE'
         return finish(result)
 
     def _attach_firebase_status(self, data):
@@ -1729,14 +1744,13 @@ class Bot:
         lines.append(f"{custom_emoji('🌐')} <b>Firebase URL</b>\n{db_url}")
         lines.append(f"{custom_emoji('🎆')} <b>API Key</b>\n{api_key}")
         summary = data.get('status_summary') or {}
-        state = str(summary.get('state') or 'UNAVAILABLE')
-        state_label = 'ACTIVE' if state == 'ACTIVE' else ('FIREBASE DEACTIVATED' if state == 'DEACTIVATED' else 'STATUS UNAVAILABLE')
-        online = summary.get('online')
-        offline = summary.get('offline')
-        total = summary.get('total')
-        fmt = lambda value: str(value) if value is not None else 'Unavailable'
-        lines.append(f"🟢 <b>Status:</b> {html.escape(state_label)}")
-        lines.append(f"👥 <b>Online:</b> {fmt(online)}\n⚫ <b>Offline:</b> {fmt(offline)}\n📊 <b>Total:</b> {fmt(total)}")
+        state = str(summary.get('state') or 'UNKNOWN')
+        if state == 'ACTIVE':
+            lines.append("🟢 <b>Status:</b> ACTIVE")
+            if all(summary.get(key) is not None for key in ('online', 'offline', 'total')):
+                lines.append(f"👥 <b>Online:</b> {summary['online']}\n⚫ <b>Offline:</b> {summary['offline']}\n📊 <b>Total:</b> {summary['total']}")
+        elif state == 'DEACTIVATED':
+            lines.append("🔴 <b>Status:</b> FIREBASE DEACTIVATED")
         link = PanelExchanger.generate_encoded_link(data)
         if link:
             lines.append(f"{custom_emoji('🔗')} <b>Panel Link:</b>\n{html.escape(link)}")
@@ -1783,11 +1797,12 @@ class Bot:
                                   update.effective_user.username),
                 timeout=APK_SCAN_TIMEOUT)
             if scan_data.get('found'):
-                await asyncio.wait_for(
-                    asyncio.to_thread(self._attach_firebase_status, scan_data), timeout=12)
                 await self._clear_user_message(update.message)
-                await self._send_user(update.message, self._format_era_result(scan_data),
-                                      parse_mode='HTML', reply_markup=self._era_buttons(scan_data))
+                sent = await self._send_user(update.message, self._format_era_result(scan_data),
+                                             parse_mode='HTML', reply_markup=self._era_buttons(scan_data))
+                # Status enrichment is non-blocking: the panel link/result is immediate.
+                if sent:
+                    self._track_task(self._enrich_status_message(sent, scan_data), 'status-enrichment')
             else:
                 await self._clear_user_message(update.message)
                 await self._send_user(update.message, "❌ No Firebase config found in this APK.")
@@ -1937,12 +1952,7 @@ class Bot:
             Database.save_panel, user_id, panel_record, self.firebase_session),
             'panel-persistence')
 
-        # Immediate conversion result includes credentials, while the saved Panel view remains private.
-        # Status probing is bounded and off the event loop; failure only yields Unavailable.
-        try:
-            await asyncio.wait_for(asyncio.to_thread(self._attach_firebase_status, firebase_data), timeout=10)
-        except asyncio.TimeoutError:
-            firebase_data['status_summary'] = {'state': 'UNAVAILABLE', 'online': None, 'offline': None, 'total': None}
+        # Immediate conversion result includes credentials, while status enrichment runs later.
         # Duplicate lookup is local-only and is kept off the event loop.
         try:
             dup = await asyncio.wait_for(
@@ -1958,19 +1968,22 @@ class Bot:
         lines.append(f"🌐 <b>Firebase URL</b>\n{db_url}\n")
         lines.append(f"🎆 <b>API Key</b>\n{api_key}\n")
         summary = firebase_data.get('status_summary') or {}
-        state = str(summary.get('state') or 'UNAVAILABLE')
-        state_label = 'ACTIVE' if state == 'ACTIVE' else ('FIREBASE DEACTIVATED' if state == 'DEACTIVATED' else 'STATUS UNAVAILABLE')
-        fmt = lambda value: str(value) if value is not None else 'Unavailable'
-        lines.append(f"🟢 <b>Status:</b> {html.escape(state_label)}\n")
-        lines.append(f"👥 <b>Online:</b> {fmt(summary.get('online'))}\n⚫ <b>Offline:</b> {fmt(summary.get('offline'))}\n📊 <b>Total:</b> {fmt(summary.get('total'))}\n")
+        if summary.get('state') == 'ACTIVE':
+            lines.append("🟢 <b>Status:</b> ACTIVE\n")
+            if all(summary.get(key) is not None for key in ('online', 'offline', 'total')):
+                lines.append(f"👥 <b>Online:</b> {summary['online']}\n⚫ <b>Offline:</b> {summary['offline']}\n📊 <b>Total:</b> {summary['total']}\n")
+        elif summary.get('state') == 'DEACTIVATED':
+            lines.append("🔴 <b>Status:</b> FIREBASE DEACTIVATED\n")
         link = PanelExchanger.generate_encoded_link(firebase_data)
         if link:
             lines.append(f"🔗 <b>Panel Link:</b>\n{html.escape(link)}\n")
         lines.append("━━━━━━━━━━━━━━━━━━")
         rendered = "\n".join(lines)
         if send_response:
-            await self._send_user(update.message, rendered, parse_mode='HTML',
-                                  reply_markup=self._era_buttons(firebase_data))
+            sent = await self._send_user(update.message, rendered, parse_mode='HTML',
+                                         reply_markup=self._era_buttons(firebase_data))
+            if sent:
+                self._track_task(self._enrich_status_message(sent, firebase_data), 'status-enrichment')
         return rendered
 
     # ---------- message dispatcher (auto-detect) ----------
