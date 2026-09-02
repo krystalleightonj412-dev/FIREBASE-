@@ -2141,9 +2141,6 @@ class Bot:
         if self._is_admin(user_id) and context.user_data.get('admin_state') == 'broadcast':
             await self.broadcast_message(update, context)
             return
-        if self._is_admin(user_id) and context.user_data.get('admin_state') == 'add_channel':
-            await self.add_channel_message(update, context)
-            return
         user_data = Database.get_user(user_id)
         user_data['username'] = user.username
         user_data['first_name'] = user.first_name
@@ -2473,8 +2470,7 @@ class Bot:
             [InlineKeyboardButton('📣 Broadcast', callback_data='admin_broadcast')],
             [InlineKeyboardButton('🚫 Ban / Unban', callback_data='admin_ban_help')],
             [InlineKeyboardButton('🛠️ Maintenance', callback_data='admin_maintenance'), InlineKeyboardButton('⏻ Bot ON/OFF', callback_data='admin_toggle_bot')],
-            [InlineKeyboardButton('👤 Manage Admins', callback_data='admin_manage_admins')],
-            [InlineKeyboardButton('📢 Add Channel', callback_data='admin_add_channel')]
+            [InlineKeyboardButton('👤 Manage Admins', callback_data='admin_manage_admins')]
         ])
         await self._safe_reply(msg_target, msg, reply_markup=keyboard)
 
@@ -2541,12 +2537,6 @@ class Bot:
             _write_bot_state(maintenance=new_value)
             await self._safe_reply(query.message, f"🛠️ Maintenance mode {'ENABLED' if new_value else 'DISABLED'}.\nNormal users will {'see a maintenance notice' if new_value else 'be served normally'}.")
             await self.admin_cmd(update, context)
-        elif action == 'admin_add_channel':
-            if not self._is_admin(user_id):
-                await self._safe_reply(query.message, '⛔ Main admin access only.')
-                return
-            context.user_data['admin_state'] = 'add_channel'
-            await self._safe_reply(query.message, '📢 Send the channel username (for example @mychannel) or its public t.me link. Send /cancel to abort.')
         elif action == 'admin_manage_admins':
             admins = sorted(_read_limited_admins())
             listed = '\n'.join(str(value) for value in admins) or '(none)'
@@ -2557,31 +2547,6 @@ class Bot:
             _write_bot_state(enabled=new_value)
             await self._safe_reply(query.message, f"⏻ Bot is now {'ON' if new_value else 'OFF'}.\nAdmins can still access the control panel.")
             await self.admin_cmd(update, context)
-
-    async def add_channel_message(self, update, context):
-        """Accept a public @username or t.me URL from a main admin."""
-        if not self._is_admin(update.effective_user.id):
-            context.user_data.pop('admin_state', None)
-            await self._safe_reply(update.message, '⛔ Main admin access only.')
-            return
-        raw = (update.message.text or '').strip()
-        channel = raw
-        if raw.startswith('https://t.me/') or raw.startswith('http://t.me/'):
-            channel = '@' + raw.rstrip('/').split('/')[-1].split('?', 1)[0]
-        elif raw.startswith('t.me/'):
-            channel = '@' + raw.rstrip('/').split('/')[-1].split('?', 1)[0]
-        if not re.fullmatch(r'@[A-Za-z0-9_]{5,32}', channel):
-            await self._safe_reply(update.message, '❌ Invalid channel. Send a public username like @mychannel or a public https://t.me/mychannel link.')
-            return
-        channels = _read_force_join_channels()
-        if channel in channels:
-            context.user_data.pop('admin_state', None)
-            await self._safe_reply(update.message, f'ℹ️ {channel} is already configured for force-join.')
-            return
-        channels.append(channel)
-        _write_force_join_channels(channels, self.firebase_session)
-        context.user_data.pop('admin_state', None)
-        await self._safe_reply(update.message, f'✅ Channel {channel} added to force-join. It will be checked for new users.')
 
     async def broadcast_message(self, update, context):
         if not self._is_admin(update.effective_user.id):
@@ -2705,7 +2670,7 @@ class Bot:
 
         self.application.add_handler(CommandHandler("start", self.start_cmd))
         self.application.add_handler(CommandHandler("help", self.help_cmd))
-        self.application.add_handler(CallbackQueryHandler(self.on_callback, pattern='^(main_menu|check_join|scan_apk|bulk_scan|my_status|user_panels|firebase_keys|firebase_keys_page:[0-9]+|admin_panel|admin_users|admin_firebase|admin_firebase_page:[0-9]+|admin_scans|admin_duplicates|admin_broadcast|admin_ban_help|admin_maintenance|admin_toggle_bot|admin_manage_admins|admin_add_channel|open_db|open_panel)$'))
+        self.application.add_handler(CallbackQueryHandler(self.on_callback, pattern='^(main_menu|check_join|scan_apk|bulk_scan|my_status|user_panels|firebase_keys|firebase_keys_page:[0-9]+|admin_panel|admin_users|admin_firebase|admin_firebase_page:[0-9]+|admin_scans|admin_duplicates|admin_broadcast|admin_ban_help|admin_maintenance|admin_toggle_bot|admin_manage_admins|open_db|open_panel)$'))
         self.application.add_handler(CommandHandler("stats", self.stats_cmd))
         self.application.add_handler(CommandHandler("keys", self.keys_cmd))
         self.application.add_handler(CommandHandler("admin", self.admin_cmd))
