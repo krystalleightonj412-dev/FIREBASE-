@@ -31,7 +31,6 @@ import subprocess
 import asyncio
 import time
 import base64
-import binascii
 import hashlib
 import html
 import logging
@@ -62,13 +61,14 @@ MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_BULK_UNCOMPRESSED_SIZE = 250 * 1024 * 1024
 MAX_TEXT_ENTRY_SIZE = 4 * 1024 * 1024
 RAW_SCAN_CHUNK_SIZE = 2 * 1024 * 1024
-MAX_CONCURRENT_SCANS = 2
+MAX_CONCURRENT_SCANS = 4
 DOWNLOAD_TIMEOUT = 60
 STATUS_CACHE_TTL = 45
 APK_SCAN_TIMEOUT = 150
 MAX_TELEGRAM_RETRIES = 4
 _STATUS_CACHE = {}
 _STATUS_CACHE_LOCK = __import__('threading').RLock()
+_DATA_LOCK = __import__('threading').RLock()
 
 # Telegram custom emoji IDs supplied by the owner. The list contains 35 entries,
 # with one repeated ID; unique IDs are mapped in source-order and any unmapped
@@ -98,6 +98,12 @@ CUSTOM_EMOJI_MAP = dict(zip(CUSTOM_EMOJI_GLYPHS, CUSTOM_EMOJI_IDS))
 def custom_emoji(glyph):
     """Return a safe Unicode glyph; never emit unsupported raw Telegram markup."""
     return glyph
+
+
+def _elapsed_ms(started_at):
+    """Return a compact monotonic duration for user-visible telemetry."""
+    return round((time.perf_counter() - started_at) * 1000, 1)
+
 
 # Directories
 DATA_DIR = Path("data")
@@ -136,6 +142,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+# HTTPX includes the complete Telegram Bot API URL in INFO logs. Since the
+# token is part of that URL, keep transport logs quiet to avoid leaking it.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 BOT_STATE_FILE = ADMIN_DIR / 'bot_state.json'
@@ -240,7 +249,8 @@ class FirebaseSync:
         try:
             session.put(url, json=data, timeout=15)
         except Exception as e:
-            logger.warning(f"Firebase sync failed for {url}: {e}")
+            # Do not log the URL: manager URLs can contain an auth token.
+            logger.warning("Firebase sync failed: %s", e)
 
     @classmethod
     def save_user(cls, session, user_id, user_data):
@@ -483,19 +493,37 @@ class FirebaseSync:
 # ==================== DATABASE ====================
 class Database:
     @staticmethod
+    def _write_json_atomic(path, data):
+        """Write a complete JSON file before replacing the old copy."""
+        path = Path(path)
+        temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(temp_path, 'w') as f:
+                json.dump(data, f, indent=2)
+            temp_path.replace(path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    @staticmethod
     def get_user(user_id):
         path = USERS_DIR / f"{user_id}.json"
-        if path.exists():
-            with open(path, 'r') as f:
-                return json.load(f)
+        with _DATA_LOCK:
+            if path.exists():
+                try:
+                    with open(path, 'r') as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+                except (OSError, json.JSONDecodeError) as exc:
+                    logger.warning("User data could not be read for %s: %s", user_id, exc)
         return {'user_id': user_id, 'scans': 0, 'panels': 0,
                 'joined': datetime.now().isoformat()}
 
     @staticmethod
     def save_user(user_id, data):
         path = USERS_DIR / f"{user_id}.json"
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2)
+        with _DATA_LOCK:
+            Database._write_json_atomic(path, data)
 
     @staticmethod
     def is_banned(user_id):
@@ -521,80 +549,81 @@ class Database:
 
     @staticmethod
     def save_scan(user_id, scan_data, firebase_session=None):
-        user = Database.get_user(user_id)
-        user['scans'] = user.get('scans', 0) + 1
-        user['last_scan'] = datetime.now().isoformat()
-        user.setdefault('username', scan_data.get('username'))
-        Database.save_user(user_id, user)
+        # Serialize the local read/modify/write section. Multiple concurrent
+        # APK jobs used to overwrite each other's JSON or leave partial files.
+        with _DATA_LOCK:
+            user = Database.get_user(user_id)
+            user['scans'] = user.get('scans', 0) + 1
+            user['last_scan'] = datetime.now().isoformat()
+            user.setdefault('username', scan_data.get('username'))
+            Database.save_user(user_id, user)
 
-        scan_data['timestamp'] = datetime.now().isoformat()
-        scan_data['scan_id'] = hashlib.md5(
-            f"{user_id}{time.time()}".encode()).hexdigest()[:8]
+            scan_data['timestamp'] = datetime.now().isoformat()
+            scan_data['scan_id'] = hashlib.md5(
+                f"{user_id}{time.time_ns()}".encode()).hexdigest()[:8]
 
-        path = SCANS_DIR / f"{user_id}.json"
-        scans = []
-        if path.exists():
-            with open(path, 'r') as f:
-                try:
-                    scans = json.load(f)
-                except json.JSONDecodeError:
-                    scans = []
-                if not isinstance(scans, list):
-                    scans = []
+            path = SCANS_DIR / f"{user_id}.json"
+            scans = []
+            if path.exists():
+                with open(path, 'r') as f:
+                    try:
+                        scans = json.load(f)
+                    except json.JSONDecodeError:
+                        scans = []
+                    if not isinstance(scans, list):
+                        scans = []
 
-        scans.append(scan_data)
+            scans.append(scan_data)
+            Database._write_json_atomic(path, scans)
 
-        with open(path, 'w') as f:
-            json.dump(scans, f, indent=2)
+            key_data = None
+            if scan_data.get('found') and (scan_data.get('database_url') or scan_data.get('firebase_url')):
+                database_url = canonical_firebase_url(scan_data.get('database_url') or scan_data.get('firebase_url'))
+                key_data = {
+                    'api_key': scan_data.get('api_key') or FIREBASE_ONLY_API_FALLBACK,
+                    'database_url': database_url,
+                    'project_id': scan_data.get('project_id'),
+                    'app_id': scan_data.get('app_id'),
+                    'user_id': user_id,
+                    'scanned_at': datetime.now().isoformat()
+                }
+                key_id = firebase_record_key(database_url)
+                key_path = FIREBASE_KEYS_DIR / f"{key_id}.json"
+                Database._write_json_atomic(key_path, key_data)
 
+        # Never hold the local file lock during network calls. Firebase sync is
+        # deliberately best-effort and must not serialize scan workers.
         if firebase_session is not None:
             FirebaseSync.save_scan(firebase_session, user_id,
                                    scan_data['scan_id'], scan_data)
-
-        if scan_data.get('found') and (scan_data.get('database_url') or scan_data.get('firebase_url')):
-            database_url = canonical_firebase_url(scan_data.get('database_url') or scan_data.get('firebase_url'))
-            key_data = {
-                # Local scan data may retain the API key for panel generation,
-                # but the durable global Firebase index is URL-only.
-                'api_key': scan_data.get('api_key') or FIREBASE_ONLY_API_FALLBACK,
-                'database_url': database_url,
-                'project_id': scan_data.get('project_id'),
-                'app_id': scan_data.get('app_id'),
-                'user_id': user_id,
-                'scanned_at': datetime.now().isoformat()
-            }
-            key_id = firebase_record_key(database_url)
-            key_path = FIREBASE_KEYS_DIR / f"{key_id}.json"
-            with open(key_path, 'w') as f:
-                json.dump(key_data, f, indent=2)
-            if firebase_session is not None:
-                FirebaseSync.save_firebase_key(firebase_session, key_id, key_data)
+            if key_data is not None:
+                FirebaseSync.save_firebase_key(
+                    firebase_session, firebase_record_key(key_data['database_url']), key_data)
 
     @staticmethod
     def save_panel(user_id, panel_data, firebase_session=None):
-        user = Database.get_user(user_id)
-        user['panels'] = user.get('panels', 0) + 1
-        Database.save_user(user_id, user)
+        with _DATA_LOCK:
+            user = Database.get_user(user_id)
+            user['panels'] = user.get('panels', 0) + 1
+            Database.save_user(user_id, user)
 
-        panel_data['timestamp'] = datetime.now().isoformat()
-        panel_data['panel_id'] = hashlib.md5(
-            f"{user_id}{time.time()}".encode()).hexdigest()[:8]
+            panel_data['timestamp'] = datetime.now().isoformat()
+            panel_data['panel_id'] = hashlib.md5(
+                f"{user_id}{time.time_ns()}".encode()).hexdigest()[:8]
 
-        path = PANEL_LOGS_DIR / f"{user_id}.json"
-        panels = []
-        if path.exists():
-            with open(path, 'r') as f:
-                try:
-                    panels = json.load(f)
-                except json.JSONDecodeError:
-                    panels = []
-                if not isinstance(panels, list):
-                    panels = []
+            path = PANEL_LOGS_DIR / f"{user_id}.json"
+            panels = []
+            if path.exists():
+                with open(path, 'r') as f:
+                    try:
+                        panels = json.load(f)
+                    except json.JSONDecodeError:
+                        panels = []
+                    if not isinstance(panels, list):
+                        panels = []
 
-        panels.append(panel_data)
-
-        with open(path, 'w') as f:
-            json.dump(panels, f, indent=2)
+            panels.append(panel_data)
+            Database._write_json_atomic(path, panels)
 
         if firebase_session is not None:
             FirebaseSync.save_panel(firebase_session, user_id,
@@ -819,7 +848,22 @@ class FirebaseScanner:
     def _extract_from_zip(self):
         try:
             with zipfile.ZipFile(self.apk_path, 'r') as apk:
-                for name in apk.namelist():
+                names = apk.namelist()
+                # Firebase config is normally in one of these files. Reading
+                # high-signal entries first avoids walking a large resource
+                # tree before reaching google-services.json/xml.
+                def priority(name):
+                    lower = name.lower()
+                    if lower.endswith(('google-services.json', 'google-services.xml')):
+                        return 0
+                    if 'google-services' in lower:
+                        return 1
+                    if 'firebase' in lower and lower.endswith(self.TEXT_EXTS):
+                        return 2
+                    if lower.endswith(('.json', '.xml')):
+                        return 3
+                    return 4
+                for name in sorted(names, key=priority):
                     lower = name.lower()
                     # google-services files first (highest signal)
                     is_gs = 'google-services' in lower
@@ -1044,29 +1088,6 @@ class PanelExchanger:
                 raw_data['found'] = True
                 return raw_data
 
-            # Zenith format: ?zenithm=<base64(base64(JSON list of {url,key}))>.
-            # Use the first valid account because one Telegram result represents one Firebase.
-            if 'zenithm' in query:
-                try:
-                    nested = query['zenithm'][0]
-                    for _ in range(2):
-                        nested = base64.b64decode(
-                            nested.replace('-', '+').replace('_', '/') +
-                            '=' * ((4 - len(nested) % 4) % 4)
-                        ).decode('utf-8')
-                    accounts = json.loads(nested)
-                    if isinstance(accounts, list):
-                        for account in accounts:
-                            if not isinstance(account, dict) or not account.get('url'):
-                                continue
-                            firebase_data['database_url'] = str(account['url']).strip()
-                            firebase_data['api_key'] = str(account.get('key') or FIREBASE_ONLY_API_FALLBACK).strip()
-                            firebase_data['project_id'] = firebase_data['database_url'].split('//', 1)[-1].split('.', 1)[0]
-                            firebase_data['found'] = True
-                            return firebase_data
-                except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
-                    pass
-
             # Current ERA X panel format: ?share=<URL-safe base64 JSON>.
             # Keep accepting the legacy ?s=<DB_URL|||API_KEY> links.
             if 'share' in query:
@@ -1087,25 +1108,8 @@ class PanelExchanger:
 
             if 's' in query:
                 encoded = query['s'][0]
-                # ZXKAI format: url-safe base64 of JSON {u:url,k:key,l:label},
-                # XOR-obfuscated with the public panel compatibility key.
                 try:
-                    padded = encoded.replace('-', '+').replace('_', '/')
-                    padded += '=' * ((4 - len(padded) % 4) % 4)
-                    raw = base64.b64decode(padded)
-                    xor_key = b'ZXKAIv1_Xk9mP2wN7qL4vR6jH3cF8yT1ZbE5sA09'
-                    decoded_bytes = bytes(value ^ xor_key[index % len(xor_key)] for index, value in enumerate(raw))
-                    record = json.loads(decoded_bytes.decode('utf-8'))
-                    if isinstance(record, dict) and record.get('u') and record.get('k'):
-                        firebase_data['database_url'] = str(record['u']).strip()
-                        firebase_data['api_key'] = str(record['k']).strip()
-                        firebase_data['project_id'] = firebase_data['database_url'].split('//', 1)[-1].split('.', 1)[0]
-                        firebase_data['found'] = True
-                        return firebase_data
-                except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
-                    pass
-                try:
-                    decoded = base64.b64decode(encoded + '=' * ((4 - len(encoded) % 4) % 4)).decode('utf-8')
+                    decoded = base64.b64decode(encoded).decode('utf-8')
                 except Exception:
                     return firebase_data
                 parts = [p.strip() for p in decoded.split('|||') if p.strip()]
@@ -1131,38 +1135,6 @@ class PanelExchanger:
                 # Fallback: treat whole decoded string as a single payload
                 firebase_data = PanelExchanger._parse_firebase_data(decoded)
                 if firebase_data.get('found'):
-                    return firebase_data
-
-            # Generic safe fallback for unknown panels: inspect only small query values
-            # and up to three base64 layers. This handles plain/nested encoded URLs,
-            # but intentionally cannot break unknown encryption without its key.
-            embedded_candidates = []
-            for query_values in query.values():
-                for original in query_values:
-                    candidate = unquote(str(original)).strip()
-                    if not candidate or len(candidate) > 8192:
-                        continue
-                    embedded_candidates.append(candidate)
-                    for _ in range(3):
-                        try:
-                            normalized = candidate.replace('-', '+').replace('_', '/')
-                            normalized += '=' * ((4 - len(normalized) % 4) % 4)
-                            decoded_bytes = base64.b64decode(normalized, validate=False)
-                            decoded_text = decoded_bytes.decode('utf-8').strip()
-                            if not decoded_text or decoded_text == candidate or len(decoded_text) > 8192:
-                                break
-                            embedded_candidates.append(decoded_text)
-                            candidate = decoded_text
-                        except (ValueError, UnicodeDecodeError, binascii.Error):
-                            break
-            for candidate in embedded_candidates:
-                extracted = PanelExchanger._parse_firebase_data(candidate)
-                if extracted.get('database_url'):
-                    for field in ('database_url', 'api_key', 'project_id', 'app_id',
-                                  'storage_bucket', 'auth_domain', 'sender_id'):
-                        if extracted.get(field) and not firebase_data.get(field):
-                            firebase_data[field] = extracted[field]
-                    firebase_data['found'] = True
                     return firebase_data
 
             for key in query:
@@ -1396,6 +1368,25 @@ class Bot:
         task.add_done_callback(finished)
         return task
 
+    async def _on_error(self, update, context):
+        """Keep an unexpected update error from stopping the polling loop."""
+        error = getattr(context, 'error', None)
+        if error:
+            logger.error(
+                'Unhandled Telegram update error: %s',
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        else:
+            logger.error('Unhandled Telegram update error without exception details')
+        message = getattr(update, 'effective_message', None)
+        if message:
+            await self._safe_reply(
+                message,
+                "❌ This request could not be completed. The bot is still running; please try again.",
+                replace_previous=False,
+            )
+
     async def _restore_background(self):
         """Restore state after polling starts; a slow Firebase cannot block getUpdates."""
         try:
@@ -1434,7 +1425,9 @@ class Bot:
     async def _send_user(self, msg, text, **kwargs):
         """Send a user-facing message after removing the previous tracked one."""
         user_id = getattr(getattr(msg, 'from_user', None), 'id', None)
-        await self._clear_user_message(msg)
+        replace_previous = kwargs.pop('replace_previous', True)
+        if replace_previous:
+            await self._clear_user_message(msg)
         try:
             sent = await msg.get_bot().send_message(chat_id=msg.chat_id, text=text, **kwargs)
         except Exception:
@@ -1491,21 +1484,13 @@ class Bot:
                 return None
 
     async def _safe_edit(self, msg, text, **kwargs):
-        """Edit a message safely, falling back to plain text if formatting is rejected."""
+        """Edit a progress message without letting Telegram errors kill a job."""
         try:
             return await self._telegram_call(
-                lambda: msg.edit_text(text, **kwargs), 'Telegram message edit')
+                lambda: msg.edit_text(text, **kwargs), 'Telegram progress edit')
         except Exception as exc:
-            logger.debug('formatted message edit failed; retrying plain text: %s', exc)
-            safe_kwargs = dict(kwargs)
-            safe_kwargs.pop('parse_mode', None)
-            try:
-                return await self._telegram_call(
-                    lambda: msg.edit_text(self._plain_text(text), **safe_kwargs),
-                    'Telegram plain message edit')
-            except Exception as final_exc:
-                logger.debug('message edit skipped: %s', final_exc)
-                return None
+            logger.debug('progress edit skipped: %s', exc)
+            return None
 
     async def _safe_delete(self, msg):
         """Delete a progress message best-effort."""
@@ -1586,22 +1571,6 @@ class Bot:
             f"{custom_emoji('⚡')} Join only the channel button(s) shown below, then check again.",
             parse_mode="HTML", reply_markup=keyboard)
 
-    async def _enrich_status_message(self, message, data):
-        """Probe status after the fast result is delivered, then edit best-effort."""
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(self._attach_firebase_status, data), timeout=10)
-            await self._safe_edit(
-                message,
-                self._format_era_result(data, data.get('apk_name')),
-                parse_mode='HTML',
-                reply_markup=self._era_buttons(data),
-            )
-        except asyncio.TimeoutError:
-            logger.info('status enrichment timed out; leaving fast result unchanged')
-        except Exception as exc:
-            logger.info('status enrichment skipped: %s', exc)
-
     # ---------- scan core ----------
     def _scan_apk_sync(self, apk_path, user_id, username=None):
         scanner = FirebaseScanner(apk_path)
@@ -1609,8 +1578,34 @@ class Bot:
         scan_data = dict(result)
         scan_data['username'] = username
         scan_data['apk_name'] = Path(apk_path).name
-        Database.save_scan(user_id, scan_data, firebase_session=self.firebase_session)
+        # Local persistence is fast and protected by _DATA_LOCK. Firebase
+        # persistence is scheduled after the result is ready so a slow or
+        # temporarily unavailable database never delays the scan response.
+        Database.save_scan(user_id, scan_data)
         return scan_data, scanner
+
+    def _persist_scan_sync(self, user_id, scan_data):
+        """Best-effort remote persistence kept off the scan critical path."""
+        try:
+            if not self.firebase_session:
+                return
+            FirebaseSync.save_scan(
+                self.firebase_session, user_id, scan_data['scan_id'], scan_data)
+            if scan_data.get('found') and (scan_data.get('database_url') or scan_data.get('firebase_url')):
+                database_url = canonical_firebase_url(
+                    scan_data.get('database_url') or scan_data.get('firebase_url'))
+                key_data = {
+                    'api_key': scan_data.get('api_key') or FIREBASE_ONLY_API_FALLBACK,
+                    'database_url': database_url,
+                    'project_id': scan_data.get('project_id'),
+                    'app_id': scan_data.get('app_id'),
+                    'user_id': user_id,
+                    'scanned_at': scan_data.get('timestamp') or datetime.now().isoformat(),
+                }
+                FirebaseSync.save_firebase_key(
+                    self.firebase_session, firebase_record_key(database_url), key_data)
+        except Exception as exc:
+            logger.warning('Deferred scan persistence failed for %s: %s', user_id, exc)
 
     @staticmethod
     def _is_duplicate(scan_data):
@@ -1644,9 +1639,7 @@ class Bot:
         and presence/connections node are available. Unknown schemas never get
         guessed counts.
         """
-        # Unknown means the probe could not establish liveness; it is not Offline
-        # and must not be rendered as Unavailable to the user.
-        result = {'state': 'UNKNOWN', 'online': None, 'offline': None, 'total': None}
+        result = {'state': 'DEACTIVATED', 'online': None, 'offline': None, 'total': None}
         url = canonical_firebase_url(database_url)
         if not url:
             return result
@@ -1663,13 +1656,11 @@ class Bot:
             return value
         query = ('?auth=' + quote(auth, safe='')) if auth and auth != FIREBASE_ONLY_API_FALLBACK else ''
         try:
-            health = req_lib.get(url + '/.json' + query, params={'shallow': 'true'}, timeout=8)
-            if health.status_code == 423:
-                result['state'] = 'DEACTIVATED'
-                return finish(result)
+            health = req_lib.get(url + '/.json' + query, params={'shallow': 'true'}, timeout=4)
             if health.status_code in (401, 403, 404):
                 return finish(result)
             if not health.ok:
+                result['state'] = 'UNAVAILABLE'
                 return finish(result)
             result['state'] = 'ACTIVE'
             try:
@@ -1679,7 +1670,7 @@ class Bot:
 
             def shallow_count(node):
                 response = req_lib.get(url + '/' + node + '.json' + query,
-                                       params={'shallow': 'true'}, timeout=6)
+                                       params={'shallow': 'true'}, timeout=3)
                 if not response.ok:
                     return None
                 value = response.json()
@@ -1770,7 +1761,7 @@ class Bot:
                 candidate_nodes = preferred_nodes
             for node in candidate_nodes:
                 try:
-                    response = req_lib.get(url + '/' + node + '.json' + query, timeout=8)
+                    response = req_lib.get(url + '/' + node + '.json' + query, timeout=4)
                     if not response.ok:
                         continue
                     total, seen, online = record_and_status_counts(response.json())
@@ -1784,7 +1775,7 @@ class Bot:
                     # If this collection has no per-record status, use a
                     # dedicated presence collection as the online source.
                     for presence_node in ('presence', 'connections', 'onlineUsers', 'online_users', 'online'):
-                        presence_response = req_lib.get(url + '/' + presence_node + '.json' + query, timeout=6)
+                        presence_response = req_lib.get(url + '/' + presence_node + '.json' + query, timeout=3)
                         if not presence_response.ok:
                             continue
                         presence_total, _, _ = record_and_status_counts(
@@ -1799,8 +1790,10 @@ class Bot:
                     continue
         except (req_lib.RequestException, ValueError, TypeError) as exc:
             logger.info('Firebase status probe unavailable for %s: %s', url, exc)
+            result['state'] = 'UNAVAILABLE'
         except Exception as exc:
             logger.warning('Unexpected Firebase status probe error: %s', exc)
+            result['state'] = 'UNAVAILABLE'
         return finish(result)
 
     def _attach_firebase_status(self, data):
@@ -1816,7 +1809,9 @@ class Bot:
     def _format_era_result(self, data, apk_name=None):
         """Build a safe HTML result with Telegram custom-emoji entities."""
         lines = []
-        dup = self._is_duplicate(data)
+        dup = data.pop('_duplicate', None)
+        if dup is None:
+            dup = self._is_duplicate(data)
         if dup:
             lines.append(f"{custom_emoji('⚠')} <b>DUPLICATE — already in database</b>")
         lines.append(f"{custom_emoji('✅')} <b>Firebase Config Found!</b>\n━━━━━━━━━━━━━━━━━━")
@@ -1828,13 +1823,14 @@ class Bot:
         lines.append(f"{custom_emoji('🌐')} <b>Firebase URL</b>\n{db_url}")
         lines.append(f"{custom_emoji('🎆')} <b>API Key</b>\n{api_key}")
         summary = data.get('status_summary') or {}
-        state = str(summary.get('state') or 'UNKNOWN')
-        if state == 'ACTIVE':
-            lines.append("🟢 <b>Status:</b> ACTIVE")
-            if all(summary.get(key) is not None for key in ('online', 'offline', 'total')):
-                lines.append(f"👥 <b>Online:</b> {summary['online']}\n⚫ <b>Offline:</b> {summary['offline']}\n📊 <b>Total:</b> {summary['total']}")
-        elif state == 'DEACTIVATED':
-            lines.append("🔴 <b>Status:</b> FIREBASE DEACTIVATED")
+        state = str(summary.get('state') or 'UNAVAILABLE')
+        state_label = 'ACTIVE' if state == 'ACTIVE' else ('FIREBASE DEACTIVATED' if state == 'DEACTIVATED' else 'STATUS UNAVAILABLE')
+        online = summary.get('online')
+        offline = summary.get('offline')
+        total = summary.get('total')
+        fmt = lambda value: str(value) if value is not None else 'Unavailable'
+        lines.append(f"🟢 <b>Status:</b> {html.escape(state_label)}")
+        lines.append(f"👥 <b>Online:</b> {fmt(online)}\n⚫ <b>Offline:</b> {fmt(offline)}\n📊 <b>Total:</b> {fmt(total)}")
         link = PanelExchanger.generate_encoded_link(data)
         if link:
             lines.append(f"{custom_emoji('🔗')} <b>Panel Link:</b>\n{html.escape(link)}")
@@ -1852,8 +1848,8 @@ class Bot:
     # ---------- APK scan handler ----------
     async def handle_apk(self, update, context, document):
         user_id = update.effective_user.id
-        while user_id in self.busy_users:
-            await asyncio.sleep(0.15)
+        started_at = time.perf_counter()
+        timings = {}
         self.busy_users.add(user_id)
         slot_acquired = False
         dest = None
@@ -1865,7 +1861,8 @@ class Bot:
             if (document.file_size or 0) > MAX_FILE_SIZE:
                 await self._safe_reply(update.message, "❌ File too large (max 50MB).")
                 return
-            status = await self._send_user(update.message, "⬇️ Downloading APK...")
+            status = await self._send_user(
+                update.message, "⬇️ Downloading APK...", replace_previous=False)
             user_file = await asyncio.wait_for(
                 context.bot.get_file(document.file_id), timeout=DOWNLOAD_TIMEOUT)
             file_name = document.file_name or "file.apk"
@@ -1875,21 +1872,49 @@ class Bot:
             dest = TEMP_DIR / f"apk_{user_id}_{uuid.uuid4().hex}_{safe_name}"
             await asyncio.wait_for(
                 user_file.download_to_drive(str(dest)), timeout=DOWNLOAD_TIMEOUT)
+            timings['download'] = _elapsed_ms(started_at)
             await self._safe_edit(status, "🔍 Scanning APK for Firebase keys...")
+            scan_started_at = time.perf_counter()
             scan_data, scanner = await asyncio.wait_for(
                 asyncio.to_thread(self._scan_apk_sync, dest, user_id,
                                   update.effective_user.username),
                 timeout=APK_SCAN_TIMEOUT)
+            timings['scan'] = round((time.perf_counter() - scan_started_at) * 1000, 1)
+            scan_data['_timings_ms'] = timings
+            self._track_task(
+                asyncio.to_thread(self._persist_scan_sync, user_id, scan_data),
+                'scan-persistence')
             if scan_data.get('found'):
-                await self._clear_user_message(update.message)
-                sent = await self._send_user(update.message, self._format_era_result(scan_data),
-                                             parse_mode='HTML', reply_markup=self._era_buttons(scan_data))
-                # Status enrichment is non-blocking: the panel link/result is immediate.
-                if sent:
-                    self._track_task(self._enrich_status_message(sent, scan_data), 'status-enrichment')
+                status_started_at = time.perf_counter()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(self._attach_firebase_status, scan_data), timeout=5)
+                except asyncio.TimeoutError:
+                    scan_data['status_summary'] = {
+                        'state': 'UNAVAILABLE', 'online': None, 'offline': None, 'total': None}
+                timings['status'] = round(
+                    (time.perf_counter() - status_started_at) * 1000, 1)
+                try:
+                    duplicate = await asyncio.wait_for(
+                        asyncio.to_thread(self._is_duplicate, scan_data), timeout=0.75)
+                except asyncio.TimeoutError:
+                    duplicate = False
+                scan_data['_duplicate'] = duplicate
+                timings['total'] = _elapsed_ms(started_at)
+                await self._send_user(
+                    update.message, self._format_era_result(scan_data),
+                    parse_mode='HTML', reply_markup=self._era_buttons(scan_data),
+                    replace_previous=False)
             else:
-                await self._clear_user_message(update.message)
-                await self._send_user(update.message, "❌ No Firebase config found in this APK.")
+                timings['total'] = _elapsed_ms(started_at)
+                await self._send_user(
+                    update.message,
+                    "❌ No Firebase config found in this APK.",
+                    replace_previous=False)
+            logger.info(
+                'APK processed user=%s file=%s found=%s timing_ms=%s',
+                user_id, Path(document.file_name or 'file.apk').name,
+                bool(scan_data.get('found')), timings)
             await self._safe_delete(status)
         except asyncio.TimeoutError:
             logger.warning('APK job timed out for user %s', user_id)
@@ -1910,8 +1935,7 @@ class Bot:
     # ---------- bulk scan ----------
     async def handle_zip(self, update, context, document):
         user_id = update.effective_user.id
-        while user_id in self.busy_users:
-            await asyncio.sleep(0.15)
+        started_at = time.perf_counter()
         self.busy_users.add(user_id)
         slot_acquired = False
         dest = None
@@ -1922,7 +1946,8 @@ class Bot:
             if (document.file_size or 0) > MAX_FILE_SIZE:
                 await self._safe_reply(update.message, "❌ File too large (max 50MB).")
                 return
-            status = await self._send_user(update.message, "⬇️ Downloading ZIP...")
+            status = await self._send_user(
+                update.message, "⬇️ Downloading ZIP...", replace_previous=False)
             user_file = await asyncio.wait_for(
                 context.bot.get_file(document.file_id), timeout=DOWNLOAD_TIMEOUT)
             dest = TEMP_DIR / f"bulk_{user_id}_{uuid.uuid4().hex}.zip"
@@ -1964,6 +1989,9 @@ class Bot:
                             asyncio.to_thread(self._scan_apk_sync, apk_path, user_id,
                                               update.effective_user.username),
                             timeout=APK_SCAN_TIMEOUT)
+                        self._track_task(
+                            asyncio.to_thread(self._persist_scan_sync, user_id, scan_data),
+                            'bulk-scan-persistence')
                         if scan_data.get('found'):
                             results.append((name, PanelExchanger.generate_encoded_link(scan_data)))
                     except asyncio.TimeoutError:
@@ -1997,6 +2025,9 @@ class Bot:
             await self._safe_edit(status,
                 f"✅ *Bulk scan complete*\n🔍 Scanned: {len(names)}\n"
                 f"✅ Found keys: {len(results)}\n⚠️ Skipped: {skipped}", parse_mode='Markdown')
+            logger.info(
+                'ZIP processed user=%s files=%s found=%s skipped=%s total_ms=%s',
+                user_id, len(names), len(results), skipped, _elapsed_ms(started_at))
         except asyncio.TimeoutError:
             logger.warning('ZIP download timed out for user %s', user_id)
             if status:
@@ -2014,7 +2045,11 @@ class Bot:
     # ---------- panel link handler ----------
     async def handle_panel_link(self, update, url, source_label="", send_response=True):
         user_id = update.effective_user.id
+        started_at = time.perf_counter()
+        timings = {'parse': None, 'status': None, 'duplicate': None, 'total': None}
+        parse_started_at = time.perf_counter()
         firebase_data = PanelExchanger.decode_panel_link(url)
+        timings['parse'] = _elapsed_ms(parse_started_at)
 
         if not firebase_data or not firebase_data.get('found'):
             return False
@@ -2036,13 +2071,23 @@ class Bot:
             Database.save_panel, user_id, panel_record, self.firebase_session),
             'panel-persistence')
 
-        # Immediate conversion result includes credentials, while status enrichment runs later.
+        # Immediate conversion result includes credentials, while the saved Panel view remains private.
+        # Status probing is bounded and off the event loop; failure only yields Unavailable.
+        status_started_at = time.perf_counter()
+        try:
+            await asyncio.wait_for(asyncio.to_thread(self._attach_firebase_status, firebase_data), timeout=5)
+        except asyncio.TimeoutError:
+            firebase_data['status_summary'] = {'state': 'UNAVAILABLE', 'online': None, 'offline': None, 'total': None}
+        timings['status'] = round((time.perf_counter() - status_started_at) * 1000, 1)
         # Duplicate lookup is local-only and is kept off the event loop.
+        duplicate_started_at = time.perf_counter()
         try:
             dup = await asyncio.wait_for(
-                asyncio.to_thread(self._is_duplicate, firebase_data), timeout=1.5)
+                asyncio.to_thread(self._is_duplicate, firebase_data), timeout=0.75)
         except asyncio.TimeoutError:
             dup = False
+        timings['duplicate'] = round((time.perf_counter() - duplicate_started_at) * 1000, 1)
+        timings['total'] = _elapsed_ms(started_at)
         lines = []
         if dup:
             lines.append("⚠️ *DUPLICATE — already in database*")
@@ -2052,22 +2097,22 @@ class Bot:
         lines.append(f"🌐 <b>Firebase URL</b>\n{db_url}\n")
         lines.append(f"🎆 <b>API Key</b>\n{api_key}\n")
         summary = firebase_data.get('status_summary') or {}
-        if summary.get('state') == 'ACTIVE':
-            lines.append("🟢 <b>Status:</b> ACTIVE\n")
-            if all(summary.get(key) is not None for key in ('online', 'offline', 'total')):
-                lines.append(f"👥 <b>Online:</b> {summary['online']}\n⚫ <b>Offline:</b> {summary['offline']}\n📊 <b>Total:</b> {summary['total']}\n")
-        elif summary.get('state') == 'DEACTIVATED':
-            lines.append("🔴 <b>Status:</b> FIREBASE DEACTIVATED\n")
+        state = str(summary.get('state') or 'UNAVAILABLE')
+        state_label = 'ACTIVE' if state == 'ACTIVE' else ('FIREBASE DEACTIVATED' if state == 'DEACTIVATED' else 'STATUS UNAVAILABLE')
+        fmt = lambda value: str(value) if value is not None else 'Unavailable'
+        lines.append(f"🟢 <b>Status:</b> {html.escape(state_label)}\n")
+        lines.append(f"👥 <b>Online:</b> {fmt(summary.get('online'))}\n⚫ <b>Offline:</b> {fmt(summary.get('offline'))}\n📊 <b>Total:</b> {fmt(summary.get('total'))}\n")
         link = PanelExchanger.generate_encoded_link(firebase_data)
         if link:
             lines.append(f"🔗 <b>Panel Link:</b>\n{html.escape(link)}\n")
         lines.append("━━━━━━━━━━━━━━━━━━")
         rendered = "\n".join(lines)
         if send_response:
-            sent = await self._send_user(update.message, rendered, parse_mode='HTML',
-                                         reply_markup=self._era_buttons(firebase_data))
-            if sent:
-                self._track_task(self._enrich_status_message(sent, firebase_data), 'status-enrichment')
+            await self._send_user(update.message, rendered, parse_mode='HTML',
+                                  reply_markup=self._era_buttons(firebase_data))
+        logger.info(
+            'Panel/Firebase processed user=%s found=true timing_ms=%s',
+            user_id, timings)
         return rendered
 
     # ---------- message dispatcher (auto-detect) ----------
@@ -2075,7 +2120,11 @@ class Bot:
         # Register user and remove the previous user-facing bot message.
         user_id = update.effective_user.id
         user = update.effective_user
-        await self._clear_user_message(update.message)
+        # Keep messages from concurrent file jobs separate. Clearing the last
+        # response here made 3-4 simultaneous APK uploads delete one another's
+        # progress/results before the work finished.
+        if not update.message.document:
+            await self._clear_user_message(update.message)
         if not await self._is_force_joined(update, context):
             await self._force_join_prompt(update, context)
             return
@@ -2650,6 +2699,7 @@ class Bot:
                             .token(BOT_TOKEN)
                             .request(telegram_request)
                             .get_updates_request(telegram_request)
+                            .concurrent_updates(8)
                             .post_init(self._post_init)
                             .build())
 
@@ -2674,6 +2724,7 @@ class Bot:
             MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, self.on_message))
         self.application.add_handler(
             MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE) & ~filters.COMMAND, self.on_message))
+        self.application.add_error_handler(self._on_error)
 
         logger.info("Starting ERA X Panel Bot (auto-detect mode)...")
         self.application.run_polling(drop_pending_updates=True)
